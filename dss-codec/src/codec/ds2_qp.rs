@@ -60,21 +60,25 @@ impl Ds2QpDecoder {
         let mut all_samples = Vec::with_capacity(total_frames * SAMPLES_PER_FRAME);
 
         for _ in 0..total_frames {
-            let samples = self.decode_frame_from_reader(&mut reader);
+            let mut frame = [0u8; 56];
+            for word in 0..28 {
+                let value = reader.read_bits(16) as u16;
+                frame[word * 2] = value as u8;
+                frame[word * 2 + 1] = (value >> 8) as u8;
+            }
+            let samples = self.decode_frame(&frame);
             all_samples.extend_from_slice(&samples);
         }
 
-        // Apply de-emphasis: y[n] = x[n] + 0.1*y[n-1]
-        let alpha = 0.1;
-        if !all_samples.is_empty() {
-            all_samples[0] += alpha * self.deemph_state;
-            for i in 1..all_samples.len() {
-                all_samples[i] += alpha * all_samples[i - 1];
-            }
-            self.deemph_state = *all_samples.last().unwrap();
-        }
-
         all_samples
+    }
+
+    /// Decode a single QP frame from its 56-byte payload.
+    pub fn decode_frame(&mut self, frame_bytes: &[u8]) -> Vec<f64> {
+        let mut reader = BitstreamReader::new(frame_bytes);
+        let mut samples = self.decode_frame_from_reader(&mut reader);
+        self.apply_deemphasis(&mut samples);
+        samples
     }
 
     fn decode_frame_from_reader(&mut self, reader: &mut BitstreamReader) -> Vec<f64> {
@@ -131,8 +135,7 @@ impl Ds2QpDecoder {
 
             // Fixed codebook excitation
             let gc = QP_EXCITATION_GAIN[*gain_idx];
-            let positions =
-                decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES);
+            let positions = decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES);
             let mut fixed_exc = [0.0f64; SUBFRAME_SIZE];
             for (pi, &pos) in positions.iter().enumerate() {
                 if pos < SUBFRAME_SIZE {
@@ -159,5 +162,16 @@ impl Ds2QpDecoder {
         }
 
         all_output
+    }
+
+    fn apply_deemphasis(&mut self, samples: &mut [f64]) {
+        let alpha = 0.1;
+        if !samples.is_empty() {
+            samples[0] += alpha * self.deemph_state;
+            for i in 1..samples.len() {
+                samples[i] += alpha * samples[i - 1];
+            }
+            self.deemph_state = *samples.last().unwrap();
+        }
     }
 }

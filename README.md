@@ -2,6 +2,8 @@
 
 Open-source decoder for Olympus DSS and DS2 (DSS Pro) proprietary dictation audio formats. Converts `.dss` and `.ds2` files to standard WAV.
 
+Also supports password-protected DS2 files when a password is provided.
+
 The codec was fully reverse-engineered from Olympus's DssDecoder.dll using Ghidra. The decoder produces output matching the proprietary DLL (1.0000 correlation, bit-exact on all tested files).
 
 ## Quick Start
@@ -15,6 +17,15 @@ cargo build --release
 
 # Resample to 16kHz (useful for ASR pipelines)
 ./target/release/dss-decode -r 16000 recording.DS2
+
+# Decode an encrypted DS2 file with a password
+./target/release/dss-decode --password 1234 recording.DS2
+
+# Decode an encrypted DS2 file using an environment variable
+DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
+
+# Decrypt an encrypted DS2 file back to a plain .ds2 container
+./target/release/dss-decode --decrypt --password 1234 recording.DS2
 ```
 
 ## Supported Formats
@@ -24,6 +35,8 @@ cargo build --release
 | `.dss` (v2/v3) | DSS SP | 11025 Hz | Header `{02\|03}dss` |
 | `.ds2` mode 0-1 | DS2 SP | 12000 Hz | Header `\x03ds2`, byte4 < 6 |
 | `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `\x03ds2`, byte4 >= 6 |
+
+Encrypted DS2 files with header `\x03enc` are also supported when a password is provided, and can be either decoded directly or normalized back to a plain `.ds2` container with `--decrypt`.
 
 ## Project Structure
 

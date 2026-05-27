@@ -14,6 +14,8 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 hound = "3"
 rubato = "0.16"
+sha1 = "0.10"
+sha2 = "0.10"
 
 [dev-dependencies]
 approx = "0.5"

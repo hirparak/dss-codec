@@ -1,6 +1,6 @@
 # dss-codec
 
-Native Rust decoder for Olympus DSS and DS2 proprietary dictation audio formats. Produces WAV output with configurable sample rate, bit depth, and channel count.
+Native Rust decoder for Olympus DSS and DS2 proprietary dictation audio formats. Produces WAV output with configurable sample rate, bit depth, and channel count, and can also normalize encrypted DS2 files back to plain container bytes.
 
 Replaces the Wine + Olympus DirectShow + NCH Switch pipeline with a standalone binary — no runtime dependencies, ~140x faster than the Python reference decoders.
 
@@ -42,6 +42,9 @@ dss-decode -c 2 recording.DS2
 
 # File info only
 dss-decode --info recording.DS2
+
+# Decrypt an encrypted DS2 file to a plain .ds2 container
+dss-decode --decrypt --password 1234 recording.DS2
 ```
 
 ### Options
@@ -56,11 +59,22 @@ dss-decode --info recording.DS2
 | `-o, --output-dir` | Output directory for batch mode | Same as input |
 | `-q, --quiet` | Suppress progress output | Off |
 | `--info` | Print file metadata and exit | Off |
+| `--decrypt` | Save decrypted/plain container bytes instead of WAV | Off |
+| `--password` | Password for encrypted DS2 input | Unset |
 
 ## Library Usage
 
 ```rust
-use dss_codec::{decode_file, decode_to_buffer, decode_and_write, AudioBuffer};
+use dss_codec::{
+    decode_file,
+    decode_file_with_password,
+    decode_to_buffer,
+    decode_to_buffer_with_password,
+    decode_and_write,
+    decrypt_file,
+    decrypt_to_bytes,
+    AudioBuffer,
+};
 use dss_codec::output::OutputConfig;
 use std::path::Path;
 
@@ -71,6 +85,14 @@ println!("Format: {:?}, {} samples at {} Hz", buf.format, buf.samples.len(), buf
 // Decode from raw bytes
 let data = std::fs::read("recording.dss")?;
 let buf = decode_to_buffer(&data)?;
+
+// Decode encrypted DS2 with a password
+let encrypted = std::fs::read("encrypted.ds2")?;
+let buf = decode_to_buffer_with_password(&encrypted, Some(b"1234"))?;
+
+// Normalize to plain container bytes (plain input passes through unchanged)
+let plain_ds2 = decrypt_file(Path::new("encrypted.ds2"), Some(b"1234"))?;
+let plain_bytes = decrypt_to_bytes(&encrypted, Some(b"1234"))?;
 
 // Decode and write WAV with custom settings
 let config = OutputConfig {
@@ -129,7 +151,7 @@ All three decoders implement CELP (Code-Excited Linear Prediction) with:
 
 ## Codec Details
 
-Full technical specification including all algorithms, tables, bit allocations, and DLL function addresses: see [CODEC_SPECIFICATION.md](CODEC_SPECIFICATION.md).
+Full technical specification including all algorithms, tables, bit allocations, encrypted DS2 notes, and DLL function addresses: see [CODEC_SPECIFICATION.md](CODEC_SPECIFICATION.md).
 
 ### Key Parameters
 

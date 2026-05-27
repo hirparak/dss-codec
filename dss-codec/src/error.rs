@@ -14,11 +14,20 @@ pub enum DecodeError {
     #[error("unsupported DS2 format type: {0}")]
     UnsupportedFormat(u8),
 
+    #[error("encrypted DS2 error: {0}")]
+    EncryptedDs2(String),
+
     #[error("bitstream exhausted: needed {needed} bits, {available} available")]
     BitstreamExhausted { needed: usize, available: usize },
 
     #[error("invalid frame data at frame {frame}: {detail}")]
     InvalidFrame { frame: usize, detail: String },
+
+    #[error("truncated data: {0}")]
+    Truncated(String),
+
+    #[error("streaming decoder is already finished")]
+    AlreadyFinished,
 
     #[error("WAV write error: {0}")]
     Wav(#[from] hound::Error),

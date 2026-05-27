@@ -8,18 +8,19 @@ Complete technical specification for the Olympus DSS and DS2 proprietary speech 
 
 1. [Overview](#overview)
 2. [File Formats](#file-formats)
-3. [Bitstream Reader](#bitstream-reader)
-4. [Demuxing](#demuxing)
-5. [DSS SP Decoder](#dss-sp-decoder)
-6. [DS2 SP Decoder](#ds2-sp-decoder)
-7. [DS2 QP Decoder](#ds2-qp-decoder)
-8. [Shared Algorithms](#shared-algorithms)
-9. [All Quantization Tables](#all-quantization-tables)
-10. [All Codebook Tables](#all-codebook-tables)
-11. [Python Reference Decoders](#python-reference-decoders)
-12. [Rust Implementation](#rust-implementation)
-13. [Verification Results](#verification-results)
-14. [DLL Function Map](#dll-function-map)
+3. [Encrypted Variant Notes](#encrypted-variant-notes)
+4. [Bitstream Reader](#bitstream-reader)
+5. [Demuxing](#demuxing)
+6. [DSS SP Decoder](#dss-sp-decoder)
+7. [DS2 SP Decoder](#ds2-sp-decoder)
+8. [DS2 QP Decoder](#ds2-qp-decoder)
+9. [Shared Algorithms](#shared-algorithms)
+10. [All Quantization Tables](#all-quantization-tables)
+11. [All Codebook Tables](#all-codebook-tables)
+12. [Python Reference Decoders](#python-reference-decoders)
+13. [Rust Implementation](#rust-implementation)
+14. [Verification Results](#verification-results)
+15. [DLL Function Map](#dll-function-map)
 
 ---
 
@@ -100,6 +101,225 @@ All audio data is organized in 512-byte blocks:
 | 6-511 | 506 | Audio payload |
 
 Frame count in block headers sums to total frame count for the file.
+
+---
+
+  ## Encrypted Variant Notes
+
+  ### High-Level Overview
+
+  Encrypted DS2 is not a different container format. It is normal DS2 with:
+
+  - file magic changed from \x03ds2 to \x03enc
+  - a 22-byte decrypt descriptor embedded in the header
+  - each 512-byte audio block transformed only over a 496-byte window
+
+  The block structure and DS2 framing remain intact. The 6-byte DS2 block header is left in clear, and the final 10
+  bytes of each 512-byte block are outside the transform window.
+
+  Cryptographically, the payload transform is:
+
+  - password-derived AES key material
+  - applied to each block as a custom self-rekeying AES decrypt mode
+  - with an adjacent-byte swap before and after the AES step
+
+  The implementation problem is not "decrypt an entire file with CBC/CTR/etc." It is:
+
+  1. parse the descriptor
+  2. derive the initial AES key from password + aux_16
+  3. initialize a small saved-state blob
+  4. for each 512-byte DS2 block, transform only bytes 6..501
+  5. after each 16-byte AES block, derive the next AES key from the current AES state
+
+  ### File-Level Structure
+
+  - Plain DS2 magic: \x03ds2
+  - Encrypted DS2 magic: \x03enc
+  - Header size remains 0x600
+  - Audio still begins at 0x600
+  - Audio remains organized as 512-byte blocks
+
+  Each encrypted block keeps the normal 6-byte DS2 block header unchanged:
+
+  | Offset | Size | Meaning |
+  |---|---:|---|
+  | 0..5 | 6 | Normal DS2 block header |
+  | 6..501 | 496 (0x1f0) | Encrypted/transformed payload window |
+  | 502..511 | 10 | Untouched payload tail |
+
+  Important consequence:
+
+  - the logical DS2 payload area is still 506 bytes wide
+  - but only the first 496 bytes of that area are transformed
+  - bytes 502..511 are not part of the crypto window
+
+  ### Decrypt Descriptor
+
+  Encrypted DS2 stores a 22-byte decrypt descriptor at header offset 0x146.
+
+  | Relative Offset | Size | Meaning |
+  |---|---:|---|
+  | 0x00..0x01 | 2 | Mode: 0x0001 = AES-128, 0x0002 = AES-256 |
+  | 0x02..0x11 | 16 | aux_16 block |
+  | 0x12..0x13 | 2 | Expected check word, little-endian |
+  | 0x14..0x15 | 2 | Present in the 22-byte descriptor, not required for decryption |
+
+  For a practical decoder, the useful fields are:
+
+  - key mode
+  - aux_16
+  - expected check word
+
+  ### Password Mixing and Key Derivation
+
+  Passwords are treated as raw bytes and are limited to 16 bytes.
+
+  Derivation process:
+
+  1. Zero-pad the password to 16 bytes.
+  2. XOR the padded password with aux_16.
+  3. Hash the resulting 16-byte mixed block.
+
+  For AES-128 (mode = 1):
+
+  - digest = SHA-1(mixed_16)
+  - key = digest[0..15]
+  - check dword = little-endian digest[16..19]
+  - compared check word = low 16 bits of that dword
+
+  For AES-256 (mode = 2):
+
+  - digest = SHA-384(mixed_16)
+  - key = digest[0..31]
+  - check dword = little-endian digest[32..35]
+  - compared check word = low 16 bits of that dword
+
+  The derived low-16-bit check word must match the descriptor before any payload block is decrypted.
+
+  ### Saved Decrypt State
+
+  The vendor builds and saves a 0x12c-byte decrypt-state blob.
+
+  Useful layout:
+
+  - +0x000 .. +0x00f : zeroed prefix
+  - +0x010 .. +0x01f : current plaintext 16-byte block
+  - +0x020 .. +0x127 : AES state / schedule blob
+  - +0x120 : AES round count
+  - +0x124 : flags (0x12 when ready)
+  - +0x128 : block byte index
+
+  Initialization behavior:
+
+  - zero +0x000 .. +0x00f
+  - set block_byte_index = 0x10
+  - expand the derived AES key into the AES state area at +0x20
+
+  ### Per-Block Transform
+
+  For each 512-byte DS2 block:
+
+  1. Take bytes 6..501 as the 496-byte transformed window.
+  2. Byte-swap each adjacent pair in that window.
+  3. Run the self-rekeying AES decrypt loop.
+  4. Byte-swap each adjacent pair again.
+  5. Write the result back to bytes 6..501.
+  6. Leave bytes 0..5 and 502..511 unchanged.
+
+  This means the transformed window is exactly 31 AES blocks of 16 bytes.
+
+  ### Self-Rekeying AES Loop
+
+  The transformed 496-byte window is processed as 31 AES blocks.
+
+  For each 16-byte chunk:
+
+  1. AES-decrypt the ciphertext block with the current key state.
+  2. Store the plaintext block at saved-state offset +0x10.
+  3. Derive the next AES key from the current AES state blob.
+  4. Expand/install that next key immediately.
+  5. Output the plaintext block.
+
+  The rekey source begins at:
+
+  (round_count + 2) * 0x10
+
+  within the saved-state blob.
+
+  That formula is important. It is not arbitrary:
+
+  - for AES-128 (round_count = 10), it points at state + 0x0c0
+  - for AES-256 (round_count = 14), it points at state + 0x100
+
+  Those locations correspond to the final-round key words in the vendor AES state blob.
+
+  #### AES-128 Rekey
+
+  - read 16 bytes from the rekey source
+  - use those 16 bytes directly as the next AES-128 key
+
+  #### AES-256 Rekey
+
+  1. Read 16 bytes from the rekey source as four big-endian 32-bit words:
+
+  [w0, w1, w2, w3]
+
+  2. Form the next 32-byte key as:
+
+  [w0, w1, w2, w3, w1, w0, w3, w2]
+
+  3. Serialize those eight words back as big-endian 32-bit words.
+  4. Expand/install that as the next AES-256 key.
+
+  This reshuffle is one of the main non-obvious details that must be implemented exactly.
+
+  ### AES State Representation
+
+  The saved-state AES words are stored in big-endian word order.
+
+  The vendor's in-memory AES blob is not just a textbook expanded key array:
+
+  - the first key words are stored raw
+  - the final round-key words are stored raw
+  - middle-round material is stored in a T-table-oriented decrypt form
+
+  For a clean decoder, you do not have to reproduce that vendor blob byte-for-byte if your AES decrypt
+  implementation produces the same block outputs. A normal AES key expansion plus inverse-round decrypt
+  implementation is sufficient for a clean implementation.
+
+  But for byte-level oracle matching, the vendor blob layout matters.
+
+  ### Important Non-Findings / Things Not To Overcomplicate
+
+  - The last 10 bytes of each 512-byte block are not part of the transform window.
+  - The 6-byte DS2 block header is not encrypted.
+  - This is not CBC, CTR, OFB, or ECB over the full block stream.
+  - The file is not reorganized; it is still normal DS2 framing with an encrypted payload window.
+
+  ### Decoder Integration
+
+  After block decryption:
+
+  - rewrite file magic from \x03enc to \x03ds2
+  - leave header structure otherwise intact
+  - decrypt each 512-byte audio block as above
+  - feed the result into the normal DS2 demux/decode path
+
+  ### Practical Implementation Notes
+
+  These are the details most likely to save another developer time:
+
+  - Treat the password as raw bytes, not UTF-16 text.
+  - Enforce the 16-byte password cap.
+  - Parse the descriptor from header offset 0x146.
+  - Compare only the low 16 bits of the derived check dword.
+  - Transform only bytes 6..501.
+  - Swap adjacent bytes before and after the AES loop.
+  - Maintain the saved-state block byte index at +0x128.
+  - Rekey after every 16-byte AES block.
+  - Read/write AES rekey words as big-endian 32-bit values.
+  - For AES-256, do not miss the [w1,w0,w3,w2] second half.
+  - Do not assume bytes 502..511 carry encrypted audio payload.
 
 ---
 
@@ -1045,7 +1265,7 @@ All codebook data is embedded as `const` arrays (no runtime file dependencies). 
 dss-codec/
   Cargo.toml              # clap 4, thiserror 2, hound 3, rubato 0.16
   src/
-    lib.rs                 # Public API: decode_file(), decode_to_buffer(), decode_and_write()
+    lib.rs                 # Public API: decrypt_file(), decode_file(), decode_to_buffer(), decode_and_write()
     main.rs                # CLI binary: dss-decode
     error.rs               # DecodeError enum
     bitstream.rs           # BitstreamReader (MSB-first within 16-bit LE words)
@@ -1076,7 +1296,16 @@ dss-codec/
 ### Public Library API
 
 ```rust
-use dss_codec::{decode_file, decode_to_buffer, decode_and_write, AudioBuffer};
+use dss_codec::{
+    decode_file,
+    decode_file_with_password,
+    decode_to_buffer,
+    decode_to_buffer_with_password,
+    decode_and_write,
+    decrypt_file,
+    decrypt_to_bytes,
+    AudioBuffer,
+};
 use dss_codec::demux::{detect_format, AudioFormat};
 use dss_codec::output::OutputConfig;
 
@@ -1088,6 +1317,14 @@ let buf: AudioBuffer = decode_file(Path::new("recording.ds2"))?;
 let data = std::fs::read("recording.dss")?;
 let buf = decode_to_buffer(&data)?;
 
+// Decode encrypted DS2 with a password
+let encrypted = std::fs::read("encrypted.ds2")?;
+let buf = decode_to_buffer_with_password(&encrypted, Some(b"1234"))?;
+
+// Normalize to plain container bytes (plain input passes through unchanged)
+let plain_ds2 = decrypt_file(Path::new("encrypted.ds2"), Some(b"1234"))?;
+let plain_bytes = decrypt_to_bytes(&encrypted, Some(b"1234"))?;
+
 // Decode and write WAV
 let config = OutputConfig { sample_rate: Some(16000), bit_depth: 16, channels: 1 };
 decode_and_write(Path::new("in.ds2"), Path::new("out.wav"), &config)?;
@@ -1098,16 +1335,18 @@ decode_and_write(Path::new("in.ds2"), Path::new("out.wav"), &config)?;
 ```
 dss-decode [OPTIONS] <INPUT...>
 
-Options:
-  -O, --output-file <PATH>   Output file (single input mode)
-  -f, --format <FORMAT>      Output format [default: wav]
-  -r, --rate <HZ>            Output sample rate [default: native]
-  -b, --bits <16|24|32>      Bit depth [default: 16]
-  -c, --channels <1|2>       Channels [default: 1]
-  -o, --output-dir <DIR>     Batch output directory
-  -q, --quiet                Suppress status output
-      --info                 Print file metadata only
-```
+  Options:
+    -O, --output-file <PATH>   Output file (single input mode)
+    -f, --format <FORMAT>      Output format [default: wav]
+    -r, --rate <HZ>            Output sample rate [default: native]
+    -b, --bits <16|24|32>      Bit depth [default: 16]
+    -c, --channels <1|2>       Channels [default: 1]
+    -o, --output-dir <DIR>     Batch output directory
+    -q, --quiet                Suppress status output
+        --decrypt              Save decrypted/plain container bytes instead of WAV
+        --password <PASSWORD>  Password for encrypted DS2 input
+        --info                 Print file metadata only
+  ```
 
 ---
 
