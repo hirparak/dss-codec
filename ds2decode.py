@@ -182,11 +182,13 @@ class SPBitstreamReader:
 
 DSS_SP_PACKET_SIZE = 42
 
-def read_ds2_file(path):
+def read_ds2_file(path, password=None):
     """Read DS2 file, detect mode (SP or QP), extract frame data.
 
     SP mode (0-1): byte-swap demuxing, returns list of 42-byte packets.
     QP mode (6-7): continuous bitstream, returns raw byte stream + frame count.
+
+    If the file is encrypted (magic \\x03enc), password is required.
 
     Returns: (frame_data, total_frames, mode)
       mode 'sp': frame_data is list of 42-byte packets
@@ -195,7 +197,16 @@ def read_ds2_file(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    if data[:4] != b'\x03ds2':
+    if data[:4] == b'\x03enc':
+        if not password:
+            raise ValueError(
+                f"Encrypted DS2 file requires a password: {path} "
+                "(use --password or decrypt with ds2decrypt.py first)"
+            )
+        from ds2decrypt import decrypt_encrypted_ds2
+
+        data = decrypt_encrypted_ds2(data, password)
+    elif data[:4] != b'\x03ds2':
         raise ValueError(f"Not a DS2 file: {path}")
 
     num_blocks = (len(data) - DS2_HEADER_SIZE) // DS2_BLOCK_SIZE
@@ -403,13 +414,13 @@ class DS2Decoder:
         self.pitch_memory = np.zeros(self.max_pitch + self.subframe_size)
         self.prng_state = 0
 
-    def decode_file(self, ds2_path, wav_path=None):
-        frame_data, total_frames, detected_mode = read_ds2_file(ds2_path)
+    def decode_file(self, ds2_path, wav_path=None, password=None):
+        frame_data, total_frames, detected_mode = read_ds2_file(ds2_path, password=password)
 
         if detected_mode != self.mode:
             print(f"Warning: file is {detected_mode} but decoder is {self.mode}, switching")
             self.__init__(detected_mode)
-            frame_data, total_frames, detected_mode = read_ds2_file(ds2_path)
+            frame_data, total_frames, detected_mode = read_ds2_file(ds2_path, password=password)
 
         all_samples = []
 
@@ -567,16 +578,19 @@ class DS2Decoder:
 # ==============================================================================
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: ds2decode.py <input.DS2> [output.wav]")
-        sys.exit(1)
+    import argparse
 
-    ds2_path = sys.argv[1]
-    if len(sys.argv) > 2:
-        wav_path = sys.argv[2]
-    else:
-        wav_path = str(Path(ds2_path).with_suffix('.decoded.wav'))
+    parser = argparse.ArgumentParser(description="Decode Olympus DSS/DS2 audio to WAV")
+    parser.add_argument("input", help="Input .ds2 or .dss file")
+    parser.add_argument("output", nargs="?", help="Output .wav path (default: input.decoded.wav)")
+    parser.add_argument(
+        "-p", "--password",
+        help="Password for encrypted DS2 files (magic \\x03enc)",
+    )
+    args = parser.parse_args()
 
-    # Auto-detect mode from file
-    decoder = DS2Decoder()  # default SP, will switch if needed
-    samples = decoder.decode_file(ds2_path, wav_path)
+    ds2_path = args.input
+    wav_path = args.output or str(Path(ds2_path).with_suffix(".decoded.wav"))
+
+    decoder = DS2Decoder()
+    samples = decoder.decode_file(ds2_path, wav_path, password=args.password)
