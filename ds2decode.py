@@ -53,6 +53,7 @@ QP_NUM_SUBFRAMES = 4
 QP_SUBFRAME_SIZE = 64         # 16 * 4.0
 QP_SAMPLES_PER_FRAME = QP_NUM_SUBFRAMES * QP_SUBFRAME_SIZE  # 256
 QP_FRAME_BITS = 448
+QP_FRAME_BYTES = QP_FRAME_BITS // 8  # 56
 QP_MIN_PITCH = 45
 QP_MAX_PITCH = 300
 QP_PITCH_RANGE = QP_MAX_PITCH - QP_MIN_PITCH + 1  # 256
@@ -64,6 +65,27 @@ QP_GAIN_BITS = 6
 QP_PULSE_BITS = 3
 QP_FIXED_CB_SIZE = math.comb(QP_SUBFRAME_SIZE, QP_EXCITATION_PULSES)
 QP_PITCH_BITS_PER_SUBFRAME = 8  # pitch read per-subframe (ceil(log2(256))=8)
+QP7_REFL_BIT_ALLOC = [7, 7, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 2]  # sum = 75
+QP7_PACKET_SHORT_BYTES = 12
+QP7_PACKET_LONG_BYTES = 56
+QP7_SHORT_GAIN_BITS = 5
+QP7_SHORT_GAIN_TABLE = [
+    0.0, 0.000152587890625, 0.00030517578125, 0.000457763671875,
+    0.000640869140625, 0.0008544921875, 0.001068115234375, 0.00128173828125,
+    0.00152587890625, 0.001800537109375, 0.002105712890625, 0.002410888671875,
+    0.00274658203125, 0.00311279296875, 0.003509521484375, 0.003936767578125,
+    0.00439453125, 0.0048828125, 0.00543212890625, 0.006011962890625,
+    0.00665283203125, 0.00732421875, 0.008056640625, 0.00885009765625,
+    0.00970458984375, 0.0106201171875, 0.011627197265625, 0.012725830078125,
+    0.013885498046875, 0.01513671875, 0.016510009765625, 0.017974853515625,
+    0.0498046875, 0.11279296875, 0.17578125, 0.23828125, 0.30126953125,
+    0.3642578125, 0.42724609375, 0.490234375, 0.55322265625, 0.61572265625,
+    0.6787109375, 0.74169921875, 0.8046875, 0.86767578125, 0.93017578125,
+    0.9931640625, 1.05615234375, 1.119140625, 1.18212890625, 1.2451171875,
+    1.3076171875, 1.37060546875, 1.43359375, 1.49658203125, 1.5595703125,
+    1.62255859375, 1.68505859375, 1.748046875, 1.81103515625, 1.8740234375,
+    1.93701171875, 2.0,
+]
 
 # File structure
 DS2_HEADER_SIZE = 0x600
@@ -182,17 +204,64 @@ class SPBitstreamReader:
 
 DSS_SP_PACKET_SIZE = 42
 
+def _is_ds2_audio_block_header(block_header):
+    if len(block_header) < DS2_BLOCK_HEADER_SIZE:
+        return False
+    fc = block_header[2]
+    fmt = block_header[4]
+    return (
+        block_header[0] == 0x0f
+        and block_header[3] == 0xff
+        and block_header[5] == 0xff
+        and fc > 0
+        and fmt in (0, 1, 2, 3, 6, 7)
+    )
+
+
+def _detect_ds2_audio_start(data):
+    if data[0] != 0x07:
+        return DS2_HEADER_SIZE
+
+    scan_end = min(len(data) - DS2_BLOCK_HEADER_SIZE, 0x10000)
+    best_start = None
+    best_score = -1
+
+    for offset in range(DS2_BLOCK_SIZE, scan_end + 1, DS2_BLOCK_SIZE):
+        if not _is_ds2_audio_block_header(data[offset:offset + DS2_BLOCK_HEADER_SIZE]):
+            continue
+
+        valid = 0
+        for i in range(16):
+            block_start = offset + i * DS2_BLOCK_SIZE
+            if block_start + DS2_BLOCK_HEADER_SIZE > len(data):
+                break
+            block_header = data[block_start:block_start + DS2_BLOCK_HEADER_SIZE]
+            if not _is_ds2_audio_block_header(block_header):
+                break
+            valid += 1
+
+        if valid >= 4:
+            return offset
+        if valid > best_score:
+            best_start = offset
+            best_score = valid
+
+    return best_start if best_start is not None else 0x1000
+
+
 def read_ds2_file(path, password=None):
     """Read DS2 file, detect mode (SP or QP), extract frame data.
 
     SP mode (0-1): byte-swap demuxing, returns list of 42-byte packets.
-    QP mode (6-7): continuous bitstream, returns raw byte stream + frame count.
+    QP mode (6): segmented bitstream, returns stream segments.
+    QP7 mode (7): segmented 12/56-byte records.
 
     If the file is encrypted (magic \\x03enc), password is required.
 
     Returns: (frame_data, total_frames, mode)
       mode 'sp': frame_data is list of 42-byte packets
-      mode 'qp': frame_data is a single bytes object (continuous bitstream)
+      mode 'qp': frame_data is list of (stream, frame_count, reset_before)
+      mode 'qp7': frame_data is list of (records, frame_count, reset_before)
     """
     with open(path, 'rb') as f:
         data = f.read()
@@ -206,33 +275,143 @@ def read_ds2_file(path, password=None):
         from ds2decrypt import decrypt_encrypted_ds2
 
         data = decrypt_encrypted_ds2(data, password)
-    elif data[:4] != b'\x03ds2':
+    elif data[:4] not in (b'\x03ds2', b'\x01ds2', b'\x07ds2'):
         raise ValueError(f"Not a DS2 file: {path}")
 
-    num_blocks = (len(data) - DS2_HEADER_SIZE) // DS2_BLOCK_SIZE
+    header_size = _detect_ds2_audio_start(data)
 
-    # Detect format from first block header byte 4
-    format_type = data[DS2_HEADER_SIZE + 4]
+    num_blocks = (len(data) - header_size) // DS2_BLOCK_SIZE
+
+    # Detect format from byte 4 of the first block that actually carries frames.
+    # Some \x07ds2 files have a segment/index table before the audio blocks.
+    format_type = 0
+    for bi in range(num_blocks):
+        bstart = header_size + bi * DS2_BLOCK_SIZE
+        if data[bstart + 2] > 0:
+            format_type = data[bstart + 4]
+            break
 
     total_frames = 0
     for bi in range(num_blocks):
-        total_frames += data[DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE + 2]
+        total_frames += data[header_size + bi * DS2_BLOCK_SIZE + 2]
+
+    if format_type == 7:
+        payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE  # 506
+        raw = bytearray()
+        for bi in range(num_blocks):
+            bstart = header_size + bi * DS2_BLOCK_SIZE
+            raw.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
+
+        def read_record(pos):
+            if pos + 2 > len(raw):
+                raise ValueError(f"incomplete format-7 selector at byte {pos}")
+            size = QP7_PACKET_SHORT_BYTES if (raw[pos + 1] & 0x80) == 0 else QP7_PACKET_LONG_BYTES
+            if pos + size > len(raw):
+                raise ValueError(
+                    f"incomplete format-7 record at byte {pos}: need {size}, have {len(raw) - pos}"
+                )
+            return bytes(raw[pos:pos + size]), pos + size
+
+        segments = []
+        seg_records = []
+        raw_read_pos = None
+
+        def flush_segment():
+            nonlocal seg_records
+            if seg_records:
+                segments.append((seg_records, len(seg_records), len(segments) > 0))
+                seg_records = []
+
+        for bi in range(num_blocks):
+            bstart = header_size + bi * DS2_BLOCK_SIZE
+            block_header = data[bstart:bstart + DS2_BLOCK_HEADER_SIZE]
+            fc = block_header[2]
+            if fc == 0:
+                flush_segment()
+                zero_end = (bi + 1) * payload_size
+                raw_read_pos = max(raw_read_pos or 0, zero_end)
+                continue
+
+            payload_off = max(0, block_header[1] * 2 - DS2_BLOCK_HEADER_SIZE)
+            frames_raw_start = bi * payload_size + payload_off
+            if raw_read_pos is None or raw_read_pos < frames_raw_start:
+                raw_read_pos = frames_raw_start
+
+            for _ in range(fc):
+                record, raw_read_pos = read_record(raw_read_pos)
+                seg_records.append(record)
+
+        flush_segment()
+        return segments, sum(seg[1] for seg in segments), 'qp7'
 
     if format_type >= 6:
-        # QP mode: continuous bitstream (no byte-swap)
-        stream = bytearray()
+        # QP mode: segmented bitstream with cut-point detection.
+        #
+        # Byte 1 of every block header encodes a continuation offset:
+        #   payload_off = b1*2 - DS2_BLOCK_HEADER_SIZE
+        # The first payload_off bytes of each block's payload are the tail of a
+        # frame that started in the previous block; the block's own frames begin
+        # at payload_off. A mismatch between the next block's start and the
+        # expected read position indicates an edit cut point.
+        payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE  # 506
+
+        raw = bytearray()
         for bi in range(num_blocks):
-            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
-            stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
-        return bytes(stream), total_frames, 'qp'
+            bstart = header_size + bi * DS2_BLOCK_SIZE
+            raw.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
+
+        segments = []
+        seg_raw_start = 0
+        seg_frames = 0
+        raw_read_pos = 0
+        first_seg = True
+
+        for bi in range(num_blocks):
+            bstart = header_size + bi * DS2_BLOCK_SIZE
+            b1 = data[bstart + 1]
+            fc = data[bstart + 2]
+
+            cont_bytes = b1 * 2
+            payload_off = max(0, cont_bytes - DS2_BLOCK_HEADER_SIZE)
+            frames_raw_start = bi * payload_size + payload_off
+
+            if bi == 0:
+                raw_read_pos = frames_raw_start
+                seg_raw_start = frames_raw_start
+            elif frames_raw_start != raw_read_pos:
+                end = min(raw_read_pos, len(raw))
+                if seg_frames > 0 and end > seg_raw_start:
+                    segments.append((
+                        bytes(raw[seg_raw_start:end]),
+                        seg_frames,
+                        not first_seg,
+                    ))
+                    first_seg = False
+                seg_raw_start = frames_raw_start
+                seg_frames = 0
+                raw_read_pos = frames_raw_start
+
+            if fc > 0:
+                seg_frames += fc
+                raw_read_pos += fc * QP_FRAME_BYTES
+
+        end = min(raw_read_pos, len(raw))
+        if seg_frames > 0 and end > seg_raw_start:
+            segments.append((
+                bytes(raw[seg_raw_start:end]),
+                seg_frames,
+                not first_seg,
+            ))
+
+        return segments, total_frames, 'qp'
     else:
         # SP mode: byte-swap demuxing
         stream = bytearray()
         for bi in range(num_blocks):
-            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
+            bstart = header_size + bi * DS2_BLOCK_SIZE
             stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
 
-        swap = (data[DS2_HEADER_SIZE] >> 7) & 1
+        swap = (data[header_size] >> 7) & 1
         swap_byte = 0
         pos = 0
         frame_packets = []
@@ -407,6 +586,7 @@ class DS2Decoder:
             self.frame_bits = QP_FRAME_BITS
             self.codebook = load_codebook('ds2_qp_codebook.npz', QP_NUM_COEFFS)
             self.pulse_amp_table = QP_PULSE_AMP_TABLE
+            self.qp7_short_gain_table = QP7_SHORT_GAIN_TABLE
 
         if mode == 'sp':
             self.pulse_amp_table = PULSE_AMP_TABLE
@@ -424,22 +604,31 @@ class DS2Decoder:
 
         all_samples = []
 
-        if self.mode == 'qp':
-            all_samples = self._decode_qp_frames(frame_data, total_frames)
+        if self.mode in ('qp', 'qp7'):
+            # QP de-emphasis: y[n] = x[n] + alpha*y[n-1], alpha=0.1.
+            # Codec and de-emphasis state reset at detected edit cut points.
+            alpha = 0.1
+            for seg_stream, seg_frames, reset_before in frame_data:
+                if reset_before:
+                    self.lattice_state = np.zeros(self.num_coeffs)
+                    self.pitch_memory = np.zeros(self.max_pitch + self.subframe_size)
+                if self.mode == 'qp7':
+                    seg_samples = np.array(self._decode_qp7_frames(seg_stream), dtype=np.float64)
+                else:
+                    seg_samples = np.array(
+                        self._decode_qp_frames(seg_stream, seg_frames), dtype=np.float64)
+                deemph = 0.0
+                for i in range(len(seg_samples)):
+                    seg_samples[i] += alpha * deemph
+                    deemph = seg_samples[i]
+                all_samples.append(seg_samples)
+            samples_arr = np.concatenate(all_samples) if all_samples else np.array([], dtype=np.float64)
         else:
             all_samples = self._decode_sp_frames(frame_data, total_frames)
+            samples_arr = np.array(all_samples, dtype=np.float64)
 
-        duration = len(all_samples) / self.sample_rate
+        duration = len(samples_arr) / self.sample_rate
         print(f"Decoded: {total_frames} frames, {duration:.2f}s at {self.sample_rate}Hz")
-
-        samples_arr = np.array(all_samples, dtype=np.float64)
-
-        # QP mode: apply de-emphasis filter y[n] = x[n] + alpha*y[n-1]
-        # Matches DssDecoder.dll FUN_10018ca0 with DAT_10066988 = 0.1
-        if self.mode == 'qp':
-            alpha = 0.1
-            for i in range(1, len(samples_arr)):
-                samples_arr[i] += alpha * samples_arr[i - 1]
 
         # Convert to int16 via truncation (matching DLL's cvttsd2si)
         samples_16 = np.clip(samples_arr, -32768, 32767).astype(np.int16)
@@ -521,6 +710,63 @@ class DS2Decoder:
             samples = self._decode_speech_with_pitches(
                 refl_indices, subframe_data, pitches)
             all_samples.extend(samples)
+        return all_samples
+
+    def _decode_qp7_frames(self, records):
+        """Decode byte-aligned format-7 records."""
+        all_samples = []
+        cb_bits = math.ceil(math.log2(
+            math.comb(self.subframe_size, self.excitation_pulses)))
+
+        def _signed16(value):
+            value &= 0xffff
+            return value if value < 0x8000 else value - 0x10000
+
+        for record in records:
+            reader = SPBitstreamReader(record)
+            # Format 7 starts each 12/56-byte record with a one-bit mode flag.
+            # Coefficients start after that flag; reading from bit 0 shifts every
+            # field and turns the decoded audio into noise.
+            is_short = reader.read_bits(1) == 0
+            refl_indices = [reader.read_bits(bits) for bits in QP7_REFL_BIT_ALLOC]
+
+            if is_short:
+                coeffs = dequantize_reflection_coeffs(refl_indices, self.codebook, self.num_coeffs)
+                short_gains = [reader.read_bits(QP7_SHORT_GAIN_BITS) for _ in range(self.num_subframes)]
+                for gain_idx in short_gains:
+                    excitation = np.zeros(self.subframe_size, dtype=np.float64)
+                    gain = self.qp7_short_gain_table[min(gain_idx, len(self.qp7_short_gain_table) - 1)]
+                    for i in range(self.subframe_size):
+                        self.prng_state = (self.prng_state * 0x209 + 0x103) & 0xffff
+                        excitation[i] = _signed16(self.prng_state) * gain
+                    output, self.lattice_state = lattice_synthesis(
+                        excitation, coeffs, self.lattice_state)
+                    self.pitch_memory = np.roll(self.pitch_memory, -self.subframe_size)
+                    self.pitch_memory[-self.subframe_size:] = excitation
+                    all_samples.extend(output)
+                continue
+
+            subframe_data = []
+            pitches = []
+            for _ in range(self.num_subframes):
+                pitch_idx = reader.read_bits(self.pitch_bits_per_subframe)
+                pg_idx = reader.read_bits(self.pitch_gain_bits)
+                cb_idx = reader.read_bits(cb_bits)
+                gain_idx = reader.read_bits(self.gain_bits)
+                pulses = [reader.read_bits(self.pulse_bits)
+                          for _ in range(self.excitation_pulses)]
+                pitches.append(pitch_idx + self.min_pitch)
+                subframe_data.append({
+                    'pitch_gain_idx': pg_idx,
+                    'cb_index': cb_idx,
+                    'gain_idx': gain_idx,
+                    'pulses': pulses,
+                })
+
+            samples = self._decode_speech_with_pitches(
+                refl_indices, subframe_data, pitches)
+            all_samples.extend(samples)
+
         return all_samples
 
     def _decode_speech(self, refl_indices, subframe_data, combined_pitch):

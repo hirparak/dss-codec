@@ -2,6 +2,8 @@ pub mod dss;
 pub mod ds2;
 pub mod grundig;
 
+use crate::demux::ds2::{detect_ds2_audio_start, detect_ds2_format_type};
+
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
@@ -11,6 +13,8 @@ pub enum AudioFormat {
     Ds2Sp,
     /// DS2 file (.ds2), QP mode (mode byte 6-7), 16000 Hz
     Ds2Qp,
+    /// DS2 file (.ds2), QP7 mode (mode byte 7), 16000 Hz
+    Ds2Qp7,
     /// Grundig DSS file (first byte 6, magic "dss"), SP codec at 16000 Hz output
     GrundigSp,
 }
@@ -20,7 +24,7 @@ impl AudioFormat {
         match self {
             AudioFormat::DssSp => 11025,
             AudioFormat::Ds2Sp => 12000,
-            AudioFormat::Ds2Qp => 16000,
+            AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
             AudioFormat::GrundigSp => 16000,
         }
     }
@@ -28,7 +32,7 @@ impl AudioFormat {
     pub fn extension(&self) -> &'static str {
         match self {
             AudioFormat::DssSp => "dss",
-            AudioFormat::Ds2Sp | AudioFormat::Ds2Qp => "ds2",
+            AudioFormat::Ds2Sp | AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => "ds2",
             AudioFormat::GrundigSp => "dss",
         }
     }
@@ -60,14 +64,17 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
         return Some(AudioFormat::DssSp);
     }
-    if data[..4] == *b"\x03ds2"
-        && data.len() > 0x604 {
-            let format_type = data[0x600 + 4];
-            if format_type >= 6 {
-                return Some(AudioFormat::Ds2Qp);
-            } else {
-                return Some(AudioFormat::Ds2Sp);
-            }
+    if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") && data.len() > 0x604 {
+        let header_size = detect_ds2_audio_start(data);
+        if data.len() <= header_size + 4 {
+            return None;
         }
+        let format_type = detect_ds2_format_type(data, header_size);
+        return Some(match format_type {
+            7 => AudioFormat::Ds2Qp7,
+            6 => AudioFormat::Ds2Qp,
+            _ => AudioFormat::Ds2Sp,
+        });
+    }
     None
 }
