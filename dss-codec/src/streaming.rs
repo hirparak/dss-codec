@@ -458,6 +458,9 @@ mod tests {
     fn make_ds2_header_only(mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 512];
         data[..4].copy_from_slice(b"\x03ds2");
+        // detect_ds2_format_type only trusts a block's mode byte when its
+        // frame count is non-zero, as in every real recording
+        data[0x600 + 2] = 1;
         data[0x600 + 4] = mode;
         data
     }
@@ -527,7 +530,11 @@ mod tests {
         assert!(samples.is_empty());
         assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
         assert_eq!(decoder.native_rate(), Some(16000));
-        assert!(decoder.finish().unwrap().is_empty());
+        // The fixture declares one frame in its block header, so finish()
+        // decodes it (256 samples per QP frame)
+        let tail = decoder.finish().unwrap();
+        assert!(!tail.is_empty());
+        assert_eq!(tail.len() % 256, 0);
     }
 
     #[test]
