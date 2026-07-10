@@ -64,6 +64,25 @@ pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
 
 /// Decode raw file bytes to an AudioBuffer, optionally decrypting encrypted DS2 input first.
 pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> Result<AudioBuffer> {
+    // DSS SP: use the block-aware batch demuxer, which handles mid-stream
+    // compact (short/padded) blocks. The streaming demuxer concatenates full
+    // block payloads and mis-reads compact-block padding as audio.
+    if detect_format(data) == Some(AudioFormat::DssSp) {
+        let (packets, _total) = crate::demux::dss::demux_dss(data)?;
+        let mut decoder = crate::codec::dss_sp::DssSpDecoder::new();
+        let mut samples = Vec::new();
+        for pkt in &packets {
+            for s in decoder.decode_frame(pkt) {
+                samples.push(s as f64);
+            }
+        }
+        return Ok(AudioBuffer {
+            samples,
+            native_rate: AudioFormat::DssSp.native_sample_rate(),
+            format: AudioFormat::DssSp,
+        });
+    }
+
     let mut decoder = DecryptingDecoderStreamer::new(password);
     let mut samples = decoder.push(data)?;
     samples.extend(decoder.finish_lenient()?);
