@@ -148,12 +148,17 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             }
         }
 
+        // total_frames counts every declared frame, but the assembled stream
+        // drops compact/empty-block padding, so the walk can run past the end
+        // of the stream near EOF; clamp both ends and emit zero-padded
+        // packets instead of slicing out of range.
         let mut pkt = [0u8; DSS_SP_FRAME_SIZE + 1];
         if swap != 0 {
             let read_size = 40;
             let end = (spos + read_size).min(stream.len());
-            let count = end - spos;
-            pkt[3..3 + count].copy_from_slice(&stream[spos..end]);
+            let start = spos.min(end);
+            let count = end - start;
+            pkt[3..3 + count].copy_from_slice(&stream[start..end]);
             spos += read_size;
             for i in (0..DSS_SP_FRAME_SIZE - 2).step_by(2) {
                 pkt[i] = pkt[i + 4];
@@ -162,8 +167,9 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             pkt[1] = swap_byte;
         } else {
             let end = (spos + DSS_SP_FRAME_SIZE).min(stream.len());
-            let count = end - spos;
-            pkt[..count].copy_from_slice(&stream[spos..end]);
+            let start = spos.min(end);
+            let count = end - start;
+            pkt[..count].copy_from_slice(&stream[start..end]);
             spos += DSS_SP_FRAME_SIZE;
             swap_byte = pkt[DSS_SP_FRAME_SIZE - 2];
         }
@@ -459,6 +465,22 @@ mod tests {
         let actual = collect_frames(&mut demuxer, &data, 127);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_dss_demux_overdeclared_frames_no_panic() {
+        // A block that declares more frames than its payload holds makes the
+        // frame walk run past the end of the assembled stream; the trailing
+        // packets must come back zero-padded instead of panicking.
+        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
+        data[0] = 2;
+        data[1..4].copy_from_slice(b"dss");
+        data.extend_from_slice(&make_dss_block(0, 3, 14, 0x20));
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 14);
+        assert_eq!(frames.len(), 14);
+        assert!(frames.iter().all(|f| f.len() == DSS_SP_FRAME_SIZE));
     }
 
     #[test]

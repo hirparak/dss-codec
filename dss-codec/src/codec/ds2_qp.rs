@@ -16,6 +16,9 @@ const SAMPLES_PER_FRAME: usize = NUM_SUBFRAMES * SUBFRAME_SIZE;
 const MIN_PITCH: u32 = 45;
 const MAX_PITCH: u32 = 300;
 const EXCITATION_PULSES: usize = 11;
+/// C(SUBFRAME_SIZE, EXCITATION_PULSES) = C(64, 11); a fixed-codebook index at
+/// or above this overflows the combinatorial number system (see decode below).
+const QP_COMB_MAX: u64 = 743_595_781_824;
 const REFL_BIT_ALLOC: [u32; 16] = [7, 7, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3];
 const QP7_REFL_BIT_ALLOC: [u32; 16] = [7, 7, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 2];
 const PITCH_GAIN_BITS: u32 = 6;
@@ -247,7 +250,18 @@ impl Ds2QpDecoder {
             }
 
             let gc = QP_EXCITATION_GAIN[*gain_idx];
-            let positions = decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES);
+            // Misaligned frames in NCH selective-extraction cut files can carry
+            // a fixed-codebook index past C(64,11); the reference decoder then
+            // drops the first pulse and places the remaining ten at positions
+            // 9..0 (verified sample-exact against the NCH decodes).
+            let positions = if *cb_idx >= QP_COMB_MAX {
+                let mut p = Vec::with_capacity(EXCITATION_PULSES);
+                p.push(SUBFRAME_SIZE); // slot 0 dropped by the range guard below
+                p.extend((1..EXCITATION_PULSES).map(|i| EXCITATION_PULSES - 1 - i));
+                p
+            } else {
+                decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES)
+            };
             let mut fixed_exc = [0.0f64; SUBFRAME_SIZE];
             for (pi, &pos) in positions.iter().enumerate() {
                 if pos < SUBFRAME_SIZE {
