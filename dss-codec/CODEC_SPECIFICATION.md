@@ -14,13 +14,14 @@ Complete technical specification for the Olympus DSS and DS2 proprietary speech 
 6. [DSS SP Decoder](#dss-sp-decoder)
 7. [DS2 SP Decoder](#ds2-sp-decoder)
 8. [DS2 QP Decoder](#ds2-qp-decoder)
-9. [Shared Algorithms](#shared-algorithms)
-10. [All Quantization Tables](#all-quantization-tables)
-11. [All Codebook Tables](#all-codebook-tables)
-12. [Python Reference Decoders](#python-reference-decoders)
-13. [Rust Implementation](#rust-implementation)
-14. [Verification Results](#verification-results)
-15. [DLL Function Map](#dll-function-map)
+9. [DS2 QP7 Decoder](#ds2-qp7-decoder)
+10. [Shared Algorithms](#shared-algorithms)
+11. [All Quantization Tables](#all-quantization-tables)
+12. [All Codebook Tables](#all-codebook-tables)
+13. [Python Reference Decoders](#python-reference-decoders)
+14. [Rust Implementation](#rust-implementation)
+15. [Verification Results](#verification-results)
+16. [DLL Function Map](#dll-function-map)
 
 ---
 
@@ -33,8 +34,13 @@ The Olympus DSS/DS2 codec family implements **CELP (Code-Excited Linear Predicti
 | DSS SP | .dss | 12000 Hz (output: 11025 Hz) | 328 | 264 (after resample) | 24ms | ~13.7 kbps |
 | DS2 SP | .ds2 | 12000 Hz | 328 | 288 | 24ms | ~13.7 kbps |
 | DS2 QP | .ds2 | 16000 Hz | 448 | 256 | 16ms | ~28 kbps |
+| DS2 QP7 | .ds2 | 16000 Hz | 448 (long) / 96 (short) | 256 | 16ms | variable |
 
-All three are mono speech codecs designed for dictation recording on Olympus devices (DS-series, DM-series, DPM-series recorders).
+These mono speech codecs are used for dictation recording on Olympus devices
+(DS-series, DM-series, DPM-series recorders). QP7 (format type `0x07`) is a
+variant of QP that adds a 12-byte comfort-noise "short" frame; it shares QP's
+synthesis and tables. A closely related family (Grundig DSS-SP / Digta CELP)
+is also supported by the decoder.
 
 ### Architecture Summary
 
@@ -92,15 +98,18 @@ All audio data is organized in 512-byte blocks:
 
 | Offset | Size | Description |
 |--------|------|-------------|
-| 0 | 1 | Byte 0: bit 7 = swap state for byte-swap demuxing |
-| 1 | 1 | Byte 1: continuation data offset (in words) |
-| 2 | 1 | Frame count in this block |
+| 0 | 1 | Byte 0: bit 7 = swap state for byte-swap demuxing (SP) |
+| 1 | 1 | Byte 1: continuation-data offset in words; the straddling frame from the previous block ends at payload offset `byte1 * 2 - 6`. Consulted by SP, QP and QP7 (see demuxing). |
+| 2 | 1 | Frame count starting in this block. `0` marks a **pause block** (segment boundary / decoder reset). |
 | 3 | 1 | 0xFF marker |
-| 4 | 1 | Format type: 0x00 = SP, 0x06 = QP |
+| 4 | 1 | Format type: `0x00` = SP, `0x06` = QP, `0x07` = QP7 |
 | 5 | 1 | 0xFF marker |
 | 6-511 | 506 | Audio payload |
 
-Frame count in block headers sums to total frame count for the file.
+The file's format type is taken from byte 4 of the **first block whose frame
+count is non-zero** (a leading pause block carries no format). Summing the
+per-block frame counts gives the file frame total; for QP7 the authoritative
+total is the sum of the actually-demuxed segments.
 
 ---
 
@@ -404,11 +413,69 @@ DSS files have a critical complication: **empty blocks** (frame_count = 0). Thes
 4. Swap state resets at block group boundaries (from next non-empty block's byte0 bit 7)
 5. FFmpeg's `dss.c` demuxer does NOT handle empty blocks — it reads straight through, producing corrupt output
 
-### DS2 QP Continuous Demuxing
+### DS2 QP / QP7 Segmented Demuxing
 
-QP mode is simpler: the payload from all blocks is concatenated into a continuous bitstream with no byte-swap. Frames are read sequentially from this bitstream using the standard bitstream reader.
+QP frames do not align to block boundaries: a frame that starts near the end of
+one block straddles into the next. For a plain, contiguous recording the naive
+model works - concatenate every block payload (506 bytes each) into one
+bitstream and read fixed 56-byte frames sequentially. The 28-block cycle then
+produces exactly 253 frames (block 0 has 10, blocks 1-27 have 9 each;
+`28 * 506 = 253 * 56`, 448 bits = 56 bytes/frame).
 
-The 28-block cycle produces exactly 253 frames: block 0 has 10 frames, blocks 1-27 have 9 frames each. `28 * 506 bytes = 253 * 56 bytes` (448 bits/frame = 56 bytes/frame).
+A file can also contain independently-encoded pieces (recording pauses, edits),
+so the demuxer emits **segments** with decoder state resets at the boundaries.
+
+**QP (format 0x06)** - fixed 56-byte frames, anchored by byte 1:
+
+Concatenate all block payloads into `raw`. Each block's byte-1 anchor declares
+where its first fresh frame starts: raw offset `bi*506 + (byte1*2 - 6)`. Walk
+blocks keeping a running read position:
+
+```
+for each block bi:
+    anchor = bi*506 + max(0, byte1*2 - 6)   # declared fresh-frame start
+    if bi == 0:
+        read_pos = segment_start = anchor
+    else if anchor != read_pos:
+        # discontinuity: close the segment, re-anchor
+        close segment raw[segment_start .. read_pos] (reset_before unless first)
+        segment_start = read_pos = anchor
+    segment.frames += fc
+    read_pos += fc * 56                      # fc = block_header[2]
+close final segment raw[segment_start .. read_pos]
+```
+
+Each segment's stream is then read as fixed 56-byte frames. Pause blocks
+(fc = 0) contribute no frames; a re-sync after a pause shows up as an anchor
+mismatch and closes the segment.
+
+> Note: Philips SpeechExec can split a dictation into separate annotation and
+> main-recording DS2 files (audio-block subsets of the parent recording with
+> per-block frame counts and byte-1 anchors rewritten consistently; see
+> dss-codec issue #3, WKju6639 samples). The anchor path above decodes them
+> correctly - verified by near-perfect correlation against the decode of the
+> intact parent recording. A block-quantized frame walk that ignored the
+> anchor was briefly adopted to bit-match NCH Switch reference wavs of these
+> split files, but those reference wavs are themselves broken decodes
+> (uncorrelated with the parent audio, +12 dB hot, clipped), and the walk
+> regressed Olympus voice-activated recordings with pause/re-sync blocks
+> (fc=0/fc=19, where the anchor is authoritative). Do not reintroduce it;
+> bless new split-file references from the parent-recording decode instead.
+
+**QP7 (format 0x07)** - variable-length records:
+
+QP7 packs records of two sizes, selected per record by bit 7 of payload byte
+`pos + 1` (short vs long). Fixed-frame straddle math does not apply, so QP7
+keeps the byte-1 continuation anchor: at each block the read position advances
+to `max(current_pos, bi*506 + (byte1*2 - 6))`, then records are read one at a
+time until the block's frame count is satisfied. A frame count of 0 is a pause
+block and closes the segment, exactly as for QP.
+
+**Segments and resets.** Both paths emit a list of segments. Every segment
+after the first carries `reset_before = true`, telling the decoder to clear
+its lattice, pitch and de-emphasis state before that segment - independently
+encoded pieces must not share filter memory. For QP the file frame total is
+the header-declared sum; for QP7 it is the sum of the segments' frame counts.
 
 ---
 
@@ -830,26 +897,82 @@ deemph_state:        f64    // De-emphasis filter state
 For each subframe (identical structure to DS2 SP but with different sizes):
 
 5. **Adaptive excitation** (same as SP but subframe_size=64, max_pitch=300)
-6. **Fixed codebook excitation**: `decode_combinatorial_index(cb_idx, 64, 11)` — 11 pulses, 64 positions
+6. **Fixed codebook excitation**: `decode_combinatorial_index(cb_idx, 64, 11)` — 11 pulses, 64 positions. A `cb_idx >= C(64,11)` (only produced by misaligned cut-file frames) triggers the overflow fallback described below instead of the normal decode.
 7. **Total excitation**: `excitation[i] = gp * adaptive_exc[i] + fixed_exc[i]`
 8. **Lattice synthesis**: `output = lattice_synthesis(excitation, coeffs, lattice_state)`
 9. **Update pitch memory**
 
 ### De-emphasis Filter
 
-Applied to the entire decoded stream **after all frames** are decoded (not per-frame):
+Applied per **segment** (see demuxing), not per-frame. `deemph_state` carries
+across adjacent segments but is cleared by a segment's `reset_before` flag, so
+the spliced pieces of a cut file do not bleed filter memory across a cut:
 
 ```
 alpha = 0.1    // DLL: DAT_10065988
 
+# on a reset_before segment: deemph_state = 0 first
 y[0] = x[0] + alpha * deemph_state
-for n in 1..total_samples:
+for n in 1..segment_samples:
     y[n] = x[n] + alpha * y[n-1]
 
-deemph_state = y[total_samples - 1]
+deemph_state = y[segment_samples - 1]
 ```
 
-This is a simple first-order IIR high-pass boost filter that compensates for pre-emphasis applied during encoding.
+This is a simple first-order IIR high-pass boost filter that compensates for pre-emphasis applied during encoding. For a single-segment (uncut) file it is equivalent to applying it once over the whole stream.
+
+---
+
+## DS2 QP7 Decoder
+
+QP7 (format type `0x07`) reuses the QP lattice synthesis, reflection codebooks,
+pitch/gain tables and combinatorial fixed codebook. It differs only in framing
+and in adding a low-rate comfort-noise frame:
+
+- Records are variable length and self-describing: **bit 0** of each record is a
+  mode flag (`0` = short, `1` = long). The demuxer picks the record size from
+  bit 7 of payload byte `pos + 1`; the decoder re-reads the same flag as the
+  first bit.
+- Reflection coefficients use `QP7_REFL_BIT_ALLOC` = `[7,7,6,6,5,5,5,5,5,4,4,4,4,3,3,2]`
+  (75 bits) - identical to QP except `coeffs[15]` is **2 bits** instead of 3.
+  The freed bit pays for the leading mode flag, keeping the long record at
+  exactly 448 bits.
+
+**Long record (56 bytes, mode = 1)** - a normal QP voiced frame:
+
+```
+mode flag:                                 1 bit
+reflection coefficients (QP7 alloc):      75 bits
+per subframe (x4):              93 bits = 372 bits   (identical to QP:
+    pitch 8, pitch-gain 6, comb CB 40, excitation gain 6, pulses 11x3)
+Total: 1 + 75 + 372 = 448 bits = 56 bytes
+```
+
+Decoding is identical to the QP long frame (including the combinatorial overflow
+fallback) after consuming the mode flag and using the QP7 reflection allocation.
+
+**Short record (12 bytes, mode = 0)** - comfort noise / low energy:
+
+```
+mode flag:                                 1 bit
+reflection coefficients (QP7 alloc):      75 bits
+per subframe (x4): 5-bit gain index    =  20 bits
+Total: 1 + 75 + 20 = 96 bits = 12 bytes
+```
+
+A short record carries no pitch or codebook data. Each of the 4 subframes reads
+a 5-bit index into `QP7_SHORT_GAIN_TABLE`, then fills the 64-sample excitation
+from a linear-congruential PRNG before the normal lattice synthesis and pitch-
+memory update:
+
+```
+state = state * 0x209 + 0x103        # 32-bit wrapping; part of decoder state,
+excitation[i] = (int16)(state) * gain #   reset to 0 by reset_before
+```
+
+Both record types feed the shared lattice synthesis and the per-segment
+de-emphasis; `reset_before` clears the lattice, pitch memory, de-emphasis and
+PRNG state at cut points.
 
 ---
 
@@ -878,6 +1001,26 @@ def decode_combinatorial_index(index, n, k):
 ```
 
 The positions are in descending order because the combinatorial encoding maps the k-subset {p_k > p_{k-1} > ... > p_1} to `sum(C(p_i, i))`. The decode naturally produces positions from largest to smallest.
+
+#### QP Overflow Fallback (cut files)
+
+A valid QP fixed-codebook index is always `< C(64, 11) = 743,595,781,824`.
+Misaligned frames in NCH selective-extraction cut files can carry an index at
+or above that bound, which the normal decode cannot represent. The reference
+decoder does not reject it; it drops the first pulse and places the remaining
+ten at fixed descending positions. Reproduce that exactly (verified
+sample-exact against the NCH decodes):
+
+```python
+QP_COMB_MAX = 743_595_781_824   # C(64, 11)
+
+if cb_idx >= QP_COMB_MAX:
+    # pulse 0 is at position 64 (out of range 0..63) and is dropped by the
+    # `pos < 64` guard in the pulse-placement loop; pulses 1..10 land at 9..0.
+    positions = [64, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+else:
+    positions = decode_combinatorial_index(cb_idx, 64, 11)
+```
 
 ### Binomial Coefficient
 
@@ -1149,6 +1292,26 @@ Total entries: 632 f64 values.
 Source: `ds2_qp_codebook.npz` (extracted from AudioSDK DLL at VA 0x1004F008, stride 256 doubles).
 
 See source file `tables/ds2_qp.rs` for all 632 entries.
+
+**QP7_SHORT_GAIN (5-bit, 64 entries, f64)** - excitation gain for QP7 short
+(comfort-noise) subframes. Two power-of-two ramps: a fine low-level ramp for
+indices 0..31 and a coarse ramp for 32..63.
+
+```
+0.000000 0.000153 0.000305 0.000458 0.000641 0.000854 0.001068 0.001282
+0.001526 0.001801 0.002106 0.002411 0.002747 0.003113 0.003510 0.003937
+0.004395 0.004883 0.005432 0.006012 0.006653 0.007324 0.008057 0.008850
+0.009705 0.010620 0.011627 0.012726 0.013885 0.015137 0.016510 0.017975
+0.049805 0.112793 0.175781 0.238281 0.301270 0.364258 0.427246 0.490234
+0.553223 0.615723 0.678711 0.741699 0.804688 0.867676 0.930176 0.993164
+1.056152 1.119141 1.182129 1.245117 1.307617 1.370605 1.433594 1.496582
+1.559570 1.622559 1.685059 1.748047 1.811035 1.874023 1.937012 2.000000
+```
+
+QP7 also reuses the QP reflection codebooks but reads `coeffs[15]` with 2 bits
+(`QP7_REFL_BIT_ALLOC`), so only the first 4 of that codebook's 8 entries are
+reachable. Its short-frame excitation PRNG is a plain LCG
+(`state = state*0x209 + 0x103`, sample = `(int16)state`).
 
 ---
 
