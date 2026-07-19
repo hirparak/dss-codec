@@ -1,6 +1,6 @@
 use clap::Parser;
-use dss_codec::EncryptionInfo;
 use dss_codec::output::OutputConfig;
+use dss_codec::EncryptionInfo;
 use std::env;
 use std::path::PathBuf;
 
@@ -178,50 +178,34 @@ fn make_decrypt_output_path(input: &PathBuf, output_dir: Option<&std::path::Path
 
 fn print_info(path: &PathBuf, _quiet: bool) {
     match dss_codec::inspect_file(path) {
-        Ok(info) => {
-            match info.encryption {
-                EncryptionInfo::None => {
-                    println!(
-                        "{}: {:?}, native rate {} Hz",
-                        path.display(),
-                        info.format,
-                        info.native_rate()
-                    );
-                }
-                EncryptionInfo::EncryptedDs2Aes128 => {
-                    println!(
-                        "{}: encrypted DS2 (AES-128), native rate {} Hz, password required",
-                        path.display(),
-                        info.native_rate()
-                    );
-                }
-                EncryptionInfo::EncryptedDs2Aes256 => {
-                    println!(
-                        "{}: encrypted DS2 (AES-256), native rate {} Hz, password required",
-                        path.display(),
-                        info.native_rate()
-                    );
-                }
-                EncryptionInfo::EncryptedUnknown(mode) => {
-                    println!(
-                        "{}: encrypted container (mode 0x{:04x}), native rate {} Hz",
-                        path.display(),
-                        mode,
-                        info.native_rate()
-                    );
-                }
-            }
-        }
+        Ok(info) => match info.encryption {
+            EncryptionInfo::None => println!(
+                "{}: {:?}, native rate {} Hz",
+                path.display(),
+                info.format,
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedDs2Aes128 => println!(
+                "{}: encrypted DS2 (AES-128), native rate {} Hz, password required",
+                path.display(),
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedDs2Aes256 => println!(
+                "{}: encrypted DS2 (AES-256), native rate {} Hz, password required",
+                path.display(),
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedUnknown(mode) => println!(
+                "{}: encrypted container (mode 0x{:04x}), native rate {} Hz",
+                path.display(),
+                mode,
+                info.native_rate()
+            ),
+        },
         Err(dss_codec::error::DecodeError::Io(e)) => {
             eprintln!("Error reading {}: {}", path.display(), e);
         }
-        Err(e) => {
-            println!(
-                "{}: info unavailable ({})",
-                path.display(),
-                e
-            );
-        }
+        Err(e) => println!("{}: info unavailable ({})", path.display(), e),
     }
 }
 

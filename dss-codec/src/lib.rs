@@ -28,6 +28,7 @@ pub struct AudioBuffer {
 }
 
 /// Lightweight file/container inspection result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileInfo {
     /// Detected audio format.
     pub format: AudioFormat,
@@ -78,30 +79,26 @@ pub fn inspect_file(path: &Path) -> Result<FileInfo> {
 
 /// Inspect raw DSS/DS2 bytes and report format/encryption metadata.
 pub fn inspect_bytes(data: &[u8]) -> Result<FileInfo> {
-    let format =
-        detect_format(data).ok_or_else(|| DecodeError::UnsupportedFormat(data.first().copied().unwrap_or(0)))?;
+    let format = detect_format(data)
+        .ok_or_else(|| DecodeError::UnsupportedFormat(data.first().copied().unwrap_or(0)))?;
 
-    if data.starts_with(&ENCRYPTED_MAGIC) {
+    let encryption = if data.starts_with(&ENCRYPTED_MAGIC) {
+        let mode_offset = crate::crypto::ds2_encrypted::DECRYPT_DESCRIPTOR_OFFSET;
         let mode = data
-            .get(crate::crypto::ds2_encrypted::DECRYPT_DESCRIPTOR_OFFSET..crate::crypto::ds2_encrypted::DECRYPT_DESCRIPTOR_OFFSET + 2)
+            .get(mode_offset..mode_offset + 2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .ok_or_else(|| DecodeError::EncryptedDs2("missing decrypt descriptor".to_string()))?;
 
-        let encryption = match mode {
+        match mode {
             1 => EncryptionInfo::EncryptedDs2Aes128,
             2 => EncryptionInfo::EncryptedDs2Aes256,
             other => EncryptionInfo::EncryptedUnknown(other),
-        };
-        Ok(FileInfo {
-            format,
-            encryption,
-        })
+        }
     } else {
-        Ok(FileInfo {
-            format,
-            encryption: EncryptionInfo::None,
-        })
-    }
+        EncryptionInfo::None
+    };
+
+    Ok(FileInfo { format, encryption })
 }
 
 /// Decode a DSS/DS2 file to an AudioBuffer.
@@ -189,4 +186,41 @@ pub fn decode_and_write_with_password(
     )?;
 
     Ok(buf)
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+    use crate::crypto::ds2_encrypted::DECRYPT_DESCRIPTOR_OFFSET;
+
+    fn encrypted_ds2(mode: u16, format_type: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 0x800];
+        data[..4].copy_from_slice(&ENCRYPTED_MAGIC);
+        data[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + 2]
+            .copy_from_slice(&mode.to_le_bytes());
+        data[0x604] = format_type;
+        data
+    }
+
+    #[test]
+    fn inspect_bytes_reports_encryption_and_format() {
+        assert_eq!(
+            inspect_bytes(&encrypted_ds2(1, 6)).unwrap(),
+            FileInfo {
+                format: AudioFormat::Ds2Qp,
+                encryption: EncryptionInfo::EncryptedDs2Aes128,
+            }
+        );
+        assert_eq!(
+            inspect_bytes(&encrypted_ds2(2, 7)).unwrap(),
+            FileInfo {
+                format: AudioFormat::Ds2Qp7,
+                encryption: EncryptionInfo::EncryptedDs2Aes256,
+            }
+        );
+        assert_eq!(
+            inspect_bytes(&encrypted_ds2(99, 0)).unwrap().encryption,
+            EncryptionInfo::EncryptedUnknown(99)
+        );
+    }
 }
