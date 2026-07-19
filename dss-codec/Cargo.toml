@@ -2,6 +2,7 @@
 name = "dss-codec"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Native DSS/DS2 audio decoder (Olympus Digital Speech Standard)"
 license = "MIT"
 homepage = "https://github.com/gaspardpetit/dss-codec"
