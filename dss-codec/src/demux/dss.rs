@@ -48,25 +48,89 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 
     // Build stream: for empty blocks, only include continuation bytes.
     // Track positions where swap state needs resetting.
+    //
+    // A "compact" (short) block declares frames that fit entirely within its
+    // payload (fc*42 + poff <= payload) leaving 0xFF padding after them. This
+    // marks a recording pause/segment boundary: the demuxer must stop at the
+    // declared frames, skip the padding, and restart framing on the next block
+    // (whose leading continuation offset is then spurious and skipped). Full
+    // blocks spill their last frame into the next block, so they are simply
+    // concatenated. A trailing compact block (last block in the file) is just
+    // a normal partial end and is treated as full (padding never reached
+    // because the frame walk stops at total_frames). See libavformat/dss.c
+    // dss_block_payload_fits / dss_align_after_compact_block.
+    const DSS_BLOCK_PAYLOAD: usize = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE;
+    let frame_bytes = |fc: usize, start_swap: usize| -> usize {
+        let mut n = 0;
+        for i in 0..fc {
+            n += if (start_swap ^ (i & 1)) != 0 {
+                DSS_SP_FRAME_SIZE - 2
+            } else {
+                DSS_SP_FRAME_SIZE
+            };
+        }
+        n
+    };
+    let is_compact =
+        |fc: usize, poff: usize| fc > 0 && fc * DSS_SP_FRAME_SIZE + poff <= DSS_BLOCK_PAYLOAD;
+
+    // Each reset position carries (new_swap, reset_swap_byte). Empty-block
+    // boundaries clear the carried swap byte (matching the DLL's empty-block
+    // path); compact-block realignments preserve it, or the first swap=1 frame
+    // of the resumed segment loses its high byte and pops.
     let mut stream = Vec::new();
-    let mut swap_reset_positions = std::collections::HashMap::new();
+    let mut swap_reset_positions: std::collections::HashMap<usize, (usize, bool)> =
+        std::collections::HashMap::new();
     let mut pos: usize = 0;
+    let mut skip_next_poff = false;
 
     for bi in 0..blocks.len() {
+        let poff = blocks[bi].cont_size;
+        let payload = blocks[bi].payload.clone();
         if blocks[bi].frame_count == 0 {
-            let cs = blocks[bi].cont_size.min(blocks[bi].payload.len());
-            stream.extend_from_slice(&blocks[bi].payload[..cs]);
+            let cs = poff.min(payload.len());
+            stream.extend_from_slice(&payload[..cs]);
             pos += cs;
             // Find next non-empty block and record its swap state
             for nbi in (bi + 1)..blocks.len() {
                 if blocks[nbi].frame_count > 0 {
-                    swap_reset_positions.insert(pos, blocks[nbi].swap);
+                    swap_reset_positions.insert(pos, (blocks[nbi].swap, true));
                     break;
                 }
             }
+            skip_next_poff = false;
+        } else if is_compact(blocks[bi].frame_count, poff) && bi + 1 < blocks.len() {
+            // Mid-stream compact block: real frames then padding.
+            let own = frame_bytes(blocks[bi].frame_count, blocks[bi].swap);
+            if skip_next_poff {
+                // Previous block ended clean: leading poff bytes are spurious.
+                let start = poff.min(payload.len());
+                let end = (poff + own).min(payload.len());
+                stream.extend_from_slice(&payload[start..end]);
+                swap_reset_positions.insert(pos, (blocks[bi].swap, false));
+                pos += end - start;
+            } else {
+                // Leading poff bytes complete the previous spanning frame.
+                let end = (poff + own).min(payload.len());
+                stream.extend_from_slice(&payload[..end]);
+                swap_reset_positions.insert(pos + poff, (blocks[bi].swap, false));
+                pos += end;
+            }
+            // Restart framing on the next block (resumed segment): preserve
+            // the carried swap byte.
+            swap_reset_positions.insert(pos, (blocks[bi + 1].swap, false));
+            skip_next_poff = true;
+        } else if skip_next_poff {
+            // Full block immediately after a compact boundary: skip its
+            // spurious continuation offset and restart framing here.
+            let start = poff.min(payload.len());
+            stream.extend_from_slice(&payload[start..]);
+            swap_reset_positions.insert(pos, (blocks[bi].swap, false));
+            pos += payload.len() - start;
+            skip_next_poff = false;
         } else {
-            stream.extend_from_slice(&blocks[bi].payload);
-            pos += blocks[bi].payload.len();
+            stream.extend_from_slice(&payload);
+            pos += payload.len();
         }
     }
 
@@ -77,9 +141,11 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let mut frame_packets = Vec::with_capacity(total_frames);
 
     for _fi in 0..total_frames {
-        if let Some(&new_swap) = swap_reset_positions.get(&spos) {
+        if let Some(&(new_swap, reset_swap_byte)) = swap_reset_positions.get(&spos) {
             swap = new_swap;
-            swap_byte = 0;
+            if reset_swap_byte {
+                swap_byte = 0;
+            }
         }
 
         let mut pkt = [0u8; DSS_SP_FRAME_SIZE + 1];

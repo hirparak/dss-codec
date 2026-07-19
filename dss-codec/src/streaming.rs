@@ -1,14 +1,17 @@
 use crate::codec::ds2_qp::Ds2QpDecoder;
 use crate::codec::ds2_sp::Ds2SpDecoder;
 use crate::codec::dss_sp::DssSpDecoder;
+use crate::codec::grundig_sp::GrundigSpDecoder;
 use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
-use crate::demux::ds2::{Ds2QpStreamDemuxer, Ds2SpStreamDemuxer};
+use crate::demux::ds2::{demux_ds2, DemuxedDs2, Ds2QpStreamDemuxer, Ds2SpStreamDemuxer};
 use crate::demux::dss::DssSpStreamDemuxer;
+use crate::demux::grundig::GrundigSpStreamDemuxer;
 use crate::demux::{detect_format, AudioFormat};
 use crate::error::{DecodeError, Result};
 
 pub struct StreamingDecoder {
     prebuffer: Vec<u8>,
+    raw_buf: Vec<u8>,
     format: Option<AudioFormat>,
     demuxer: Option<ActiveDemuxer>,
     decoder: Option<ActiveDecoder>,
@@ -37,18 +40,21 @@ enum ActiveDemuxer {
     Dss(DssSpStreamDemuxer),
     Ds2Sp(Ds2SpStreamDemuxer),
     Ds2Qp(Ds2QpStreamDemuxer),
+    Grundig(GrundigSpStreamDemuxer),
 }
 
 enum ActiveDecoder {
     Dss(DssSpDecoder),
     Ds2Sp(Ds2SpDecoder),
     Ds2Qp(Ds2QpDecoder),
+    Grundig(GrundigSpDecoder),
 }
 
 impl StreamingDecoder {
     pub fn new() -> Self {
         Self {
             prebuffer: Vec::new(),
+            raw_buf: Vec::new(),
             format: None,
             demuxer: None,
             decoder: None,
@@ -93,11 +99,13 @@ impl StreamingDecoder {
                 return Ok(samples);
             }
 
-            return if self.prebuffer.len() >= 4 && self.prebuffer[..4] == *b"\x03ds2" {
+            return if self.prebuffer.len() >= 4
+                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+            {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
                 && self.prebuffer[1..4] == *b"dss"
-                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3)
+                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6)
             {
                 Err(DecodeError::Truncated("DSS header".to_string()))
             } else {
@@ -131,11 +139,13 @@ impl StreamingDecoder {
                 return Ok(samples);
             }
 
-            return if self.prebuffer.len() >= 4 && self.prebuffer[..4] == *b"\x03ds2" {
+            return if self.prebuffer.len() >= 4
+                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+            {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
                 && self.prebuffer[1..4] == *b"dss"
-                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3)
+                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6)
             {
                 Err(DecodeError::Truncated("DSS header".to_string()))
             } else {
@@ -166,8 +176,9 @@ impl StreamingDecoder {
 
         if self.prebuffer.len() >= 4 {
             let is_dss_prefix = self.prebuffer[1..4] == *b"dss"
-                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3);
-            let is_ds2_prefix = self.prebuffer[..4] == *b"\x03ds2";
+                && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6);
+            let is_ds2_prefix =
+                matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2");
             if !is_dss_prefix && !is_ds2_prefix {
                 return Err(DecodeError::UnsupportedFormat(
                     self.prebuffer.first().copied().unwrap_or(0),
@@ -190,18 +201,30 @@ impl StreamingDecoder {
                 self.demuxer = Some(ActiveDemuxer::Ds2Sp(Ds2SpStreamDemuxer::new()));
                 self.decoder = Some(ActiveDecoder::Ds2Sp(Ds2SpDecoder::new()));
             }
-            AudioFormat::Ds2Qp => {
+            AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => {
                 self.demuxer = Some(ActiveDemuxer::Ds2Qp(Ds2QpStreamDemuxer::new()));
                 self.decoder = Some(ActiveDecoder::Ds2Qp(Ds2QpDecoder::new()));
+            }
+            AudioFormat::GrundigSp => {
+                let header_blocks = self.prebuffer[0];
+                self.demuxer =
+                    Some(ActiveDemuxer::Grundig(GrundigSpStreamDemuxer::new(header_blocks)));
+                self.decoder = Some(ActiveDecoder::Grundig(GrundigSpDecoder::new()));
             }
         }
     }
 
     fn push_active(&mut self, bytes: &[u8]) -> Result<Vec<f64>> {
+        if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
+            self.raw_buf.extend_from_slice(bytes);
+            return Ok(Vec::new());
+        }
+
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.push(bytes)?,
             Some(ActiveDemuxer::Ds2Sp(demuxer)) => demuxer.push(bytes)?,
             Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.push(bytes)?,
+            Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.push(bytes)?,
             None => return Ok(Vec::new()),
         };
 
@@ -209,10 +232,15 @@ impl StreamingDecoder {
     }
 
     fn finish_active(&mut self) -> Result<Vec<f64>> {
+        if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
+            return self.decode_buffered_ds2_qp();
+        }
+
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.finish()?,
             Some(ActiveDemuxer::Ds2Sp(demuxer)) => demuxer.finish()?,
             Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.finish()?,
+            Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.finish()?,
             None => Vec::new(),
         };
 
@@ -220,14 +248,32 @@ impl StreamingDecoder {
     }
 
     fn finish_active_lenient(&mut self) -> Result<Vec<f64>> {
+        if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
+            return self.decode_buffered_ds2_qp();
+        }
+
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.finish_lenient()?,
             Some(ActiveDemuxer::Ds2Sp(demuxer)) => demuxer.finish_lenient()?,
             Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.finish_lenient()?,
+            Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.finish_lenient()?,
             None => Vec::new(),
         };
 
         self.decode_frames(frames)
+    }
+
+    fn decode_buffered_ds2_qp(&mut self) -> Result<Vec<f64>> {
+        let demuxed = demux_ds2(&self.raw_buf)?;
+        match (demuxed, self.decoder.as_mut()) {
+            (DemuxedDs2::QpSegments { segments, .. }, Some(ActiveDecoder::Ds2Qp(decoder))) => {
+                Ok(decoder.decode_qp_segments(&segments))
+            }
+            (DemuxedDs2::Qp7Segments { segments, .. }, Some(ActiveDecoder::Ds2Qp(decoder))) => {
+                Ok(decoder.decode_qp7_segments(&segments))
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn decode_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<Vec<f64>> {
@@ -247,6 +293,17 @@ impl StreamingDecoder {
             Some(ActiveDecoder::Ds2Qp(decoder)) => {
                 for frame in frames {
                     samples.extend_from_slice(&decoder.decode_frame(&frame));
+                }
+            }
+            Some(ActiveDecoder::Grundig(decoder)) => {
+                // The Grundig demuxer emits every frame at once (at stream
+                // finish). Each frame buffers 12 kHz PCM; finish() runs the
+                // polyphase resampler over the whole utterance -> 16 kHz.
+                if !frames.is_empty() {
+                    for frame in frames {
+                        let _ = decoder.decode_frame(&frame);
+                    }
+                    samples.extend(decoder.finish().into_iter().map(|s| s as f64));
                 }
             }
             None => {}
@@ -390,8 +447,8 @@ impl Default for StreamingDecoder {
 }
 
 fn is_plain_prefix(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x03ds2")
-        || (bytes.len() >= 4 && bytes[1..4] == *b"dss" && (bytes[0] == 2 || bytes[0] == 3))
+    matches!(bytes.get(..4), Some(b"\x03ds2") | Some(b"\x01ds2") | Some(b"\x07ds2"))
+        || (bytes.len() >= 4 && bytes[1..4] == *b"dss" && (bytes[0] == 2 || bytes[0] == 3 || bytes[0] == 6))
 }
 
 #[cfg(test)]
@@ -401,6 +458,9 @@ mod tests {
     fn make_ds2_header_only(mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 512];
         data[..4].copy_from_slice(b"\x03ds2");
+        // detect_ds2_format_type only trusts a block's mode byte when its
+        // frame count is non-zero, as in every real recording
+        data[0x600 + 2] = 1;
         data[0x600 + 4] = mode;
         data
     }
@@ -470,7 +530,11 @@ mod tests {
         assert!(samples.is_empty());
         assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
         assert_eq!(decoder.native_rate(), Some(16000));
-        assert!(decoder.finish().unwrap().is_empty());
+        // The fixture declares one frame in its block header, so finish()
+        // decodes it (256 samples per QP frame)
+        let tail = decoder.finish().unwrap();
+        assert!(!tail.is_empty());
+        assert_eq!(tail.len() % 256, 0);
     }
 
     #[test]

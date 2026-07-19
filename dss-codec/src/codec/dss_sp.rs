@@ -15,13 +15,77 @@ fn clip16(x: i64) -> i64 {
     x.clamp(-32768, 32767)
 }
 
-fn clip32767(x: i64) -> i64 {
-    x.clamp(-32767, 32767)
+/// FFmpeg dss_sp_clip_sinc_pcm: values in [-32768, 32767]
+/// pass through; anything beyond clamps to +-32767. This preserves -32768
+/// (unlike a plain +-32767 clamp) and maps out-of-range negatives to -32767
+/// (unlike av_clip_int16). It is the decoder's internal clip everywhere, and
+/// also the output clip on repack (NCH) streams.
+fn clip_sinc_pcm(x: i64) -> i64 {
+    if (-32768..=32767).contains(&x) {
+        x
+    } else if x <= 0 {
+        -32767
+    } else {
+        32767
+    }
 }
 
 /// DSS_SP_FORMULA: ((a * 32768 + b * c) + 16384) >> 15
 fn formula(a: i64, b: i64, c: i64) -> i64 {
     ((a * 32768 + b * c) + 16384) >> 15
+}
+
+/// Combinatorial-table pulse-position decode (FFmpeg dss_sp_decode_pulse_pos_d32
+/// / the pulse_dec_mode table path — both use the same table numerically).
+fn decode_pulse_pos_table(cp: i64, pulse_pos: &mut [usize; 7]) {
+    let mut pulse = 7usize;
+    let mut pulse_idx = 71usize;
+    let mut c = cp;
+    for slot in pulse_pos.iter_mut() {
+        while c < COMBINATORIAL_TABLE[pulse][pulse_idx] {
+            if pulse_idx == 0 {
+                break;
+            }
+            pulse_idx -= 1;
+        }
+        c -= COMBINATORIAL_TABLE[pulse][pulse_idx];
+        pulse -= 1;
+        *slot = pulse_idx;
+    }
+}
+
+/// Alternate placement decode (FFmpeg dss_sp_decode_pulse_pos_alt). Succeeds
+/// only when all 7 pulses place and the remainder is exactly 0.
+///
+/// Uses u32 wrapping arithmetic to match FFmpeg's `unsigned int` exactly: the
+/// Pascal-triangle update can underflow, and u32 wrap (vs a signed value going
+/// negative) flips the `<=` comparison, changing placements for some cp values.
+fn decode_pulse_pos_alt(cp: i64, pulse_pos: &mut [usize; 7]) -> bool {
+    let mut c72: [u32; 8] = [
+        72, 2556, 59640, 1028790, 13991544, 156238908, 1473109704, 3379081753,
+    ];
+    let mut index = 6usize;
+    let mut placements = 0;
+    pulse_pos[6] = 0;
+    let mut combined = cp as u32;
+    for i in (0..=71i32).rev() {
+        if c72[index] <= combined {
+            combined = combined.wrapping_sub(c72[index]);
+            pulse_pos[6 - index] = i as usize;
+            placements += 1;
+            if index == 0 {
+                break;
+            }
+            index -= 1;
+        }
+        c72[0] = c72[0].wrapping_sub(1);
+        if index > 0 {
+            for a in 0..index {
+                c72[a + 1] = c72[a + 1].wrapping_sub(c72[a]);
+            }
+        }
+    }
+    combined == 0 && placements == 7
 }
 
 struct SubframeParams {
@@ -44,6 +108,14 @@ pub struct DssSpDecoder {
     noise_state: i64,
     pulse_dec_mode: bool,
     shift_amount: i32,
+    /* Pulse-decode routing, matching FFmpeg dss_sp.c.
+     * comb_pulse_mode: frame-0 flag (b0&0x80 ? b0&1 : 0).
+     * repack: per-frame; comb streams read bit7 of byte1, else always 1.
+     * repack_pulse_tbl: sticky table-decode latch (cleared only on cp clamp). */
+    comb_pulse_mode: bool,
+    repack: bool,
+    repack_pulse_tbl: bool,
+    frame_idx: usize,
 }
 
 impl Default for DssSpDecoder {
@@ -67,6 +139,10 @@ impl DssSpDecoder {
             noise_state: 0,
             pulse_dec_mode: true,
             shift_amount: 0,
+            comb_pulse_mode: false,
+            repack: false,
+            repack_pulse_tbl: false,
+            frame_idx: 0,
         }
     }
 
@@ -97,8 +173,8 @@ impl DssSpDecoder {
                         self.err_buf2[i] = self.err_buf2[i - 1];
                     }
                     tmp = (tmp + 4096) >> shift;
-                    self.err_buf2[1] = clip32767(tmp);
-                    self.vector_buf[a] = clip32767(tmp);
+                    self.err_buf2[1] = clip_sinc_pcm(tmp);
+                    self.vector_buf[a] = clip_sinc_pcm(tmp);
                 }
             }
 
@@ -112,13 +188,26 @@ impl DssSpDecoder {
                 .copy_from_slice(&self.working_buffer[j]);
         }
 
-        self.update_state(&working_flat)
+        let out = self.update_state(&working_flat);
+        self.frame_idx += 1;
+        out
     }
 
     fn unpack_coeffs(
         &mut self,
         pkt: &[u8],
     ) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<SubframeParams>) {
+        // Stream routing: comb_pulse_mode is a frame-0 flag; repack
+        // is per-packet on comb streams (bit7 of byte1) and always 1 otherwise.
+        if self.frame_idx == 0 {
+            self.comb_pulse_mode = (pkt[0] & 0x80) != 0 && (pkt[0] & 1) != 0;
+        }
+        self.repack = if self.comb_pulse_mode {
+            (pkt[1] >> 7) & 1 != 0
+        } else {
+            true
+        };
+
         let mut reader = BitstreamReader::new(pkt);
 
         // Reflection coefficient indices: 2x5 + 6x4 + 6x3 = 52 bits
@@ -155,25 +244,33 @@ impl DssSpDecoder {
             });
         }
 
-        // Decode pulse positions using combinatorial table
+        // Decode pulse positions. Mirrors FFmpeg dss_sp.c: comb
+        // streams (repack==0) use the plain combinatorial table; repack streams
+        // (0a8/DS23 clean CELP; some 4bed frames) try an alternate placement
+        // decode first and fall back to the table via a sticky latch.
         for j in 0..SUBFRAMES {
             let combined = subframes[j].combined_pulse_pos;
             if combined < C72_BINOMIALS[7] {
-                if self.pulse_dec_mode {
-                    let mut pulse = 7usize;
-                    let mut pulse_idx = 71usize;
+                if self.repack {
                     let mut cp = combined;
-                    for i in 0..7 {
-                        while cp < COMBINATORIAL_TABLE[pulse][pulse_idx] {
-                            if pulse_idx == 0 {
-                                break;
-                            }
-                            pulse_idx -= 1;
-                        }
-                        cp -= COMBINATORIAL_TABLE[pulse][pulse_idx];
-                        pulse -= 1;
-                        subframes[j].pulse_pos[i] = pulse_idx;
+                    if cp > C72_BINOMIALS[6] - 1 {
+                        cp = C72_BINOMIALS[6] - 1;
+                        self.pulse_dec_mode = false;
+                        self.repack_pulse_tbl = false;
                     }
+                    if self.repack_pulse_tbl {
+                        decode_pulse_pos_table(cp, &mut subframes[j].pulse_pos);
+                    } else {
+                        let mut alt = [0usize; 7];
+                        if decode_pulse_pos_alt(cp, &mut alt) {
+                            subframes[j].pulse_pos = alt;
+                        } else {
+                            self.repack_pulse_tbl = true;
+                            decode_pulse_pos_table(cp, &mut subframes[j].pulse_pos);
+                        }
+                    }
+                } else if self.pulse_dec_mode {
+                    decode_pulse_pos_table(combined, &mut subframes[j].pulse_pos);
                 }
             } else {
                 self.pulse_dec_mode = false;
@@ -286,7 +383,7 @@ impl DssSpDecoder {
 
         for i in 0..SUBFRAME_SIZE {
             let tmp = (gain * self.vector_buf[i]) >> 11;
-            self.vector_buf[i] = clip32767(tmp);
+            self.vector_buf[i] = clip_sinc_pcm(tmp);
         }
     }
 
@@ -351,7 +448,7 @@ impl DssSpDecoder {
                     self.audio_buf[i] = self.audio_buf[i - 1];
                 }
                 tmp = (tmp + 4096) >> shift;
-                self.vector_buf[a] = clip32767(tmp);
+                self.vector_buf[a] = clip_sinc_pcm(tmp);
             }
         }
 
@@ -368,8 +465,8 @@ impl DssSpDecoder {
                     self.err_buf1[i] = self.err_buf1[i - 1];
                 }
                 tmp = (tmp + 4096) >> shift;
-                self.err_buf1[1] = clip32767(tmp);
-                self.vector_buf[a] = clip32767(tmp);
+                self.err_buf1[1] = clip_sinc_pcm(tmp);
+                self.vector_buf[a] = clip_sinc_pcm(tmp);
             }
         }
 
@@ -382,12 +479,12 @@ impl DssSpDecoder {
         if size > 1 {
             for i in (1..size).rev() {
                 let tmp = formula(self.vector_buf[i], lf, self.vector_buf[i - 1]);
-                self.vector_buf[i] = clip32767(tmp);
+                self.vector_buf[i] = clip_sinc_pcm(tmp);
             }
         }
         {
             let tmp = formula(self.vector_buf[0], lf, v36);
-            self.vector_buf[0] = clip32767(tmp);
+            self.vector_buf[0] = clip_sinc_pcm(tmp);
         }
 
         // Scale down
@@ -405,15 +502,20 @@ impl DssSpDecoder {
 
         let bias = ((409 * t) >> 15) << 15;
         let mut noise = [0i64; SUBFRAME_SIZE];
-        noise[0] = clip32767((bias + 32358 * self.noise_state) >> 15);
+        noise[0] = clip_sinc_pcm((bias + 32358 * self.noise_state) >> 15);
         for i in 1..size {
-            noise[i] = clip32767((bias + 32358 * noise[i - 1]) >> 15);
+            noise[i] = clip_sinc_pcm((bias + 32358 * noise[i - 1]) >> 15);
         }
         self.noise_state = noise[size - 1];
 
         for i in 0..size {
             let tmp = (self.vector_buf[i] * noise[i]) >> 11;
-            self.working_buffer[subframe_idx][i] = clip32767(tmp);
+            // FFmpeg: repack (NCH) -> clip_work(=clip_sinc_pcm); else av_clip_int16.
+            self.working_buffer[subframe_idx][i] = if self.repack {
+                clip_sinc_pcm(tmp)
+            } else {
+                clip16(tmp)
+            };
         }
     }
 
@@ -439,7 +541,9 @@ impl DssSpDecoder {
             }
             offset += 1;
             tmp >>= 15;
-            output.push(clip16(tmp) as i16);
+            // FFmpeg: repack (NCH) -> clip_sinc_pcm; else av_clip_int16.
+            let s = if self.repack { clip_sinc_pcm(tmp) } else { clip16(tmp) };
+            output.push(s as i16);
 
             a = (a + 1) % 11;
             if a == 0 {
