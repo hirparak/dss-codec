@@ -267,12 +267,16 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
         let mut frame_packets = Vec::with_capacity(total_frames);
 
         for _fi in 0..total_frames {
+            // total_frames counts every declared frame, so the walk can run
+            // past the end of the stream near EOF; clamp both ends and emit
+            // zero-padded packets instead of slicing out of range.
             let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
             if swap != 0 {
                 let read_size = 40;
                 let end = (pos + read_size).min(stream.len());
-                let count = end - pos;
-                pkt[3..3 + count].copy_from_slice(&stream[pos..end]);
+                let start = pos.min(end);
+                let count = end - start;
+                pkt[3..3 + count].copy_from_slice(&stream[start..end]);
                 pos += read_size;
                 for i in (0..DSS_SP_PACKET_SIZE - 2).step_by(2) {
                     pkt[i] = pkt[i + 4];
@@ -281,8 +285,9 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
                 pkt[1] = swap_byte;
             } else {
                 let end = (pos + DSS_SP_PACKET_SIZE).min(stream.len());
-                let count = end - pos;
-                pkt[..count].copy_from_slice(&stream[pos..end]);
+                let start = pos.min(end);
+                let count = end - start;
+                pkt[..count].copy_from_slice(&stream[start..end]);
                 pos += DSS_SP_PACKET_SIZE;
                 swap_byte = pkt[DSS_SP_PACKET_SIZE - 2];
             }
@@ -530,6 +535,24 @@ mod tests {
         actual.extend(demuxer.finish().unwrap());
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_ds2_sp_demux_overdeclared_frames_no_panic() {
+        // A block that declares more frames than its payload holds makes the
+        // frame walk run past the end of the assembled stream; the trailing
+        // packets must come back zero-padded instead of panicking.
+        let data = make_ds2_file(0, 14, 0x20);
+        let (packets, total) = match demux_ds2(&data).unwrap() {
+            DemuxedDs2::Sp {
+                packets,
+                total_frames,
+            } => (packets, total_frames),
+            _ => panic!("expected DS2 SP packets"),
+        };
+        assert_eq!(total, 14);
+        assert_eq!(packets.len(), 14);
+        assert!(packets.iter().all(|p| p.len() == DSS_SP_PACKET_SIZE));
     }
 
     #[test]
