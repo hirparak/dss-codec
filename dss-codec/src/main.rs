@@ -1,7 +1,6 @@
 use clap::Parser;
-use dss_codec::crypto::ds2_encrypted::{parse_decrypt_descriptor, ENCRYPTED_MAGIC};
-use dss_codec::demux::detect_format;
 use dss_codec::output::OutputConfig;
+use dss_codec::EncryptionInfo;
 use std::env;
 use std::path::PathBuf;
 
@@ -178,42 +177,35 @@ fn make_decrypt_output_path(input: &PathBuf, output_dir: Option<&std::path::Path
 }
 
 fn print_info(path: &PathBuf, _quiet: bool) {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error reading {}: {}", path.display(), e);
-            return;
-        }
-    };
-
-    if data.starts_with(&ENCRYPTED_MAGIC) {
-        match parse_decrypt_descriptor(&data) {
-            Ok(desc) => {
-                println!(
-                    "{}: encrypted DS2 ({:?}), password required",
-                    path.display(),
-                    desc.key_mode
-                );
-            }
-            Err(e) => {
-                println!("{}: encrypted DS2 (descriptor error: {})", path.display(), e);
-            }
-        }
-        return;
-    }
-
-    match detect_format(&data) {
-        Some(fmt) => {
-            println!(
+    match dss_codec::inspect_file(path) {
+        Ok(info) => match info.encryption {
+            EncryptionInfo::None => println!(
                 "{}: {:?}, native rate {} Hz",
                 path.display(),
-                fmt,
-                fmt.native_sample_rate()
-            );
+                info.format,
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedDs2Aes128 => println!(
+                "{}: encrypted DS2 (AES-128), native rate {} Hz, password required",
+                path.display(),
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedDs2Aes256 => println!(
+                "{}: encrypted DS2 (AES-256), native rate {} Hz, password required",
+                path.display(),
+                info.native_rate()
+            ),
+            EncryptionInfo::EncryptedUnknown(mode) => println!(
+                "{}: encrypted container (mode 0x{:04x}), native rate {} Hz",
+                path.display(),
+                mode,
+                info.native_rate()
+            ),
+        },
+        Err(dss_codec::error::DecodeError::Io(e)) => {
+            eprintln!("Error reading {}: {}", path.display(), e);
         }
-        None => {
-            println!("{}: unknown format", path.display());
-        }
+        Err(e) => println!("{}: info unavailable ({})", path.display(), e),
     }
 }
 

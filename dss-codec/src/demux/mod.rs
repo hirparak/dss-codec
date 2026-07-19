@@ -64,6 +64,14 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
         return Some(AudioFormat::DssSp);
     }
+    if data[..4] == *b"\x03enc" && data.len() > 0x604 {
+        let format_type = data[0x600 + 4];
+        return Some(match format_type {
+            7 => AudioFormat::Ds2Qp7,
+            6 => AudioFormat::Ds2Qp,
+            _ => AudioFormat::Ds2Sp,
+        });
+    }
     if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") && data.len() > 0x604 {
         let header_size = detect_ds2_audio_start(data);
         if data.len() <= header_size + 4 {
@@ -77,4 +85,34 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ds2_like_file(magic: [u8; 4], mode: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 0x600 + 0x200];
+        data[..4].copy_from_slice(&magic);
+        data[0x600 + 4] = mode;
+        data
+    }
+
+    #[test]
+    fn detect_format_recognizes_encrypted_ds2_qp() {
+        let data = make_ds2_like_file(*b"\x03enc", 6);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn detect_format_recognizes_encrypted_ds2_qp7() {
+        let data = make_ds2_like_file(*b"\x03enc", 7);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
+    }
+
+    #[test]
+    fn detect_format_recognizes_encrypted_ds2_sp() {
+        let data = make_ds2_like_file(*b"\x03enc", 0);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Sp));
+    }
 }
