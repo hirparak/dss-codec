@@ -152,7 +152,7 @@ pub const ADAPTIVE_GAIN: [i32; 32] = [
     3194, 3323, 3451, 3580, 3709, 3838, 3967, 4096,
 ];
 
-/// Sinc interpolation coefficients for 12000->11025 Hz resampling
+/// Sinc interpolation coefficients for the 11:12 decimation, 12000 -> 11000 Hz
 pub const SINC: [i32; 67] = [
     262, 293, 323, 348, 356, 336, 269, 139,
     -67, -358, -733, -1178, -1668, -2162, -2607, -2940,

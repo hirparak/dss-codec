@@ -3,7 +3,7 @@
 //! Architecture: CELP with 14 reflection coefficients, pitch-adaptive
 //! excitation, 7-pulse fixed codebook, a 14-stage lattice synthesis filter
 //! driven by the raw reflection coefficients, a de-emphasis post-filter, and
-//! 11:12 sinc resampling (12000→11025 Hz).
+//! 11:12 sinc decimation (12000→11000 Hz).
 
 use crate::bitstream::BitstreamReader;
 use crate::tables::dss_sp::*;

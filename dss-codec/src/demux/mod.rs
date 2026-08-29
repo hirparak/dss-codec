@@ -7,7 +7,8 @@ use crate::demux::ds2::{detect_ds2_audio_start, detect_ds2_format_type};
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
-    /// Pure DSS file (.dss), SP codec at 11025 Hz output
+    /// Pure DSS file (.dss), SP codec: decoded at 12000 Hz, then decimated
+    /// 11:12 to 11000 Hz output
     DssSp,
     /// DS2 file (.ds2), SP mode (mode byte 0-1), 12000 Hz
     Ds2Sp,
@@ -22,7 +23,7 @@ pub enum AudioFormat {
 impl AudioFormat {
     pub fn native_sample_rate(&self) -> u32 {
         match self {
-            AudioFormat::DssSp => 11025,
+            AudioFormat::DssSp => 11000,
             AudioFormat::Ds2Sp => 12000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
             AudioFormat::GrundigSp => 16000,
