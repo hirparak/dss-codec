@@ -129,6 +129,13 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             pos += payload.len() - start;
             skip_next_poff = false;
         } else {
+            // Chaque bloc declare, dans le bit de poids fort de son octet 0, la
+            // parite d'echange de sa premiere trame. La marche par trames la
+            // deduit d'ordinaire par alternance, mais rien ne garantit qu'elle
+            // reste en phase : on la resseme depuis le bloc, qui fait foi.
+            swap_reset_positions
+                .entry(pos + poff.min(payload.len()))
+                .or_insert((blocks[bi].swap, false));
             stream.extend_from_slice(&payload);
             pos += payload.len();
         }
