@@ -264,8 +264,13 @@ impl DssSpDecoder {
                 if self.repack {
                     let mut cp = combined;
                     if cp > C72_BINOMIALS[6] - 1 {
+                        // Un indice au-dela du domaine 7-parmi-72 se ramene a
+                        // sa borne. Ce n'est pas une raison pour condamner le
+                        // decodage par table de toutes les trames suivantes :
+                        // une fois pulse_dec_mode eteint, les trames hors
+                        // repack ne decodaient plus aucune position et leurs
+                        // sept impulsions restaient toutes en 0.
                         cp = C72_BINOMIALS[6] - 1;
-                        self.pulse_dec_mode = false;
                         self.repack_pulse_tbl = false;
                     }
                     if self.repack_pulse_tbl {
