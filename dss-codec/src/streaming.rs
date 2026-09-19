@@ -3,7 +3,9 @@ use crate::codec::ds2_sp::Ds2SpDecoder;
 use crate::codec::dss_sp::DssSpDecoder;
 use crate::codec::grundig_sp::GrundigSpDecoder;
 use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
-use crate::demux::ds2::{demux_ds2, DemuxedDs2, Ds2QpStreamDemuxer, Ds2SpStreamDemuxer};
+use crate::demux::ds2::{
+    demux_ds2, is_plain_ds2_magic, DemuxedDs2, Ds2QpStreamDemuxer, Ds2SpStreamDemuxer,
+};
 use crate::demux::dss::DssSpStreamDemuxer;
 use crate::demux::grundig::GrundigSpStreamDemuxer;
 use crate::demux::{detect_format, AudioFormat};
@@ -100,7 +102,7 @@ impl StreamingDecoder {
             }
 
             return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+                && is_plain_ds2_magic(&self.prebuffer)
             {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
@@ -140,7 +142,7 @@ impl StreamingDecoder {
             }
 
             return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+                && is_plain_ds2_magic(&self.prebuffer)
             {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
@@ -178,7 +180,7 @@ impl StreamingDecoder {
             let is_dss_prefix = self.prebuffer[1..4] == *b"dss"
                 && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6);
             let is_ds2_prefix =
-                matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2");
+                is_plain_ds2_magic(&self.prebuffer);
             if !is_dss_prefix && !is_ds2_prefix {
                 return Err(DecodeError::UnsupportedFormat(
                     self.prebuffer.first().copied().unwrap_or(0),
@@ -447,7 +449,7 @@ impl Default for StreamingDecoder {
 }
 
 fn is_plain_prefix(bytes: &[u8]) -> bool {
-    matches!(bytes.get(..4), Some(b"\x03ds2") | Some(b"\x01ds2") | Some(b"\x07ds2"))
+    is_plain_ds2_magic(bytes)
         || (bytes.len() >= 4 && bytes[1..4] == *b"dss" && (bytes[0] == 2 || bytes[0] == 3 || bytes[0] == 6))
 }
 

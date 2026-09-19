@@ -2,7 +2,7 @@ pub mod dss;
 pub mod ds2;
 pub mod grundig;
 
-use crate::demux::ds2::{detect_ds2_audio_start, detect_ds2_format_type};
+use crate::demux::ds2::{detect_ds2_audio_start, detect_ds2_format_type, is_plain_ds2_magic};
 
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
             _ => AudioFormat::Ds2Sp,
         });
     }
-    if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") && data.len() > 0x604 {
+    if is_plain_ds2_magic(data) && data.len() > 0x604 {
         let header_size = detect_ds2_audio_start(data);
         if data.len() <= header_size + 4 {
             return None;
@@ -97,6 +97,33 @@ mod tests {
         data[..4].copy_from_slice(&magic);
         data[0x600 + 4] = mode;
         data
+    }
+
+    // Builds a plain DS2 whose audio blocks start after a longer-than-0x600
+    // header, the layout written by newer recorder firmware.
+    fn make_offset_header_ds2(magic: [u8; 4], audio_start: usize, mode: u8) -> Vec<u8> {
+        let blocks = 8;
+        let mut data = vec![0xffu8; audio_start + blocks * 0x200];
+        data[..4].copy_from_slice(&magic);
+        for i in 0..blocks {
+            let b = audio_start + i * 0x200;
+            data[b..b + 6].copy_from_slice(&[0x0f, 0x03, 0x0a, 0xff, mode, 0xff]);
+        }
+        data
+    }
+
+    #[test]
+    fn detect_format_recognizes_0x08_ds2_qp7_with_4k_header() {
+        let data = make_offset_header_ds2(*b"\x08ds2", 0x1000, 7);
+        assert_eq!(detect_ds2_audio_start(&data), 0x1000);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
+    }
+
+    #[test]
+    fn detect_format_still_recognizes_0x07_ds2_qp7_with_4k_header() {
+        let data = make_offset_header_ds2(*b"\x07ds2", 0x1000, 7);
+        assert_eq!(detect_ds2_audio_start(&data), 0x1000);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
     }
 
     #[test]

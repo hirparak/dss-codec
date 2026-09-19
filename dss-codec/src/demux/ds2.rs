@@ -27,6 +27,19 @@ pub struct Ds2Qp7Segment {
     pub reset_before: bool,
 }
 
+/// True when `bytes` starts with the magic of an unencrypted DS2 container.
+///
+/// The leading byte differs between recorder firmware generations; every
+/// variant here uses the same `ds2` tag and block layout. `\x07` and `\x08`
+/// files also carry a variable-length header before the first audio block,
+/// which [`detect_ds2_audio_start`] locates by scanning.
+pub(crate) fn is_plain_ds2_magic(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(..4),
+        Some(b"\x01ds2") | Some(b"\x03ds2") | Some(b"\x07ds2") | Some(b"\x08ds2")
+    )
+}
+
 pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
     if block_header.len() < DS2_BLOCK_HEADER_SIZE {
         return false;
@@ -41,7 +54,7 @@ pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
 }
 
 pub(crate) fn detect_ds2_audio_start(data: &[u8]) -> usize {
-    if data.first().copied() != Some(0x07) {
+    if !matches!(data.first().copied(), Some(0x07) | Some(0x08)) {
         return DS2_HEADER_SIZE;
     }
 
@@ -104,7 +117,7 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// For SP: frame_data is a Vec<Vec<u8>> of packets.
 /// For QP/QP7: frame data is segmented to preserve state resets at cut points.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
-    if data.len() < 4 || !matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") {
+    if !is_plain_ds2_magic(data) {
         return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
     }
 
@@ -261,45 +274,94 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
                 .extend_from_slice(&data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE]);
         }
 
-        let mut swap = ((data[header_size] >> 7) & 1) as usize;
-        let mut swap_byte: u8 = 0;
-        let mut pos: usize = 0;
+        let payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE;
+        let mut reader = SpFrameReader::default();
         let mut frame_packets = Vec::with_capacity(total_frames);
+        let mut started = false;
 
-        for _fi in 0..total_frames {
-            // total_frames counts every declared frame, so the walk can run
-            // past the end of the stream near EOF; clamp both ends and emit
-            // zero-padded packets instead of slicing out of range.
-            let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
-            if swap != 0 {
-                let read_size = 40;
-                let end = (pos + read_size).min(stream.len());
-                let start = pos.min(end);
-                let count = end - start;
-                pkt[3..3 + count].copy_from_slice(&stream[start..end]);
-                pos += read_size;
-                for i in (0..DSS_SP_PACKET_SIZE - 2).step_by(2) {
-                    pkt[i] = pkt[i + 4];
-                }
-                pkt[DSS_SP_PACKET_SIZE] = 0;
-                pkt[1] = swap_byte;
-            } else {
-                let end = (pos + DSS_SP_PACKET_SIZE).min(stream.len());
-                let start = pos.min(end);
-                let count = end - start;
-                pkt[..count].copy_from_slice(&stream[start..end]);
-                pos += DSS_SP_PACKET_SIZE;
-                swap_byte = pkt[DSS_SP_PACKET_SIZE - 2];
+        // Walk block by block. Each block header records where its first frame
+        // starts (byte 1, in 16-bit words from the block start) and the swap
+        // phase it starts in (bit 7 of byte 0). In continuous audio that always
+        // equals where the previous block's frames ended. Recorders that insert
+        // or overwrite audio start a new segment mid-file, and reading straight
+        // on through the old segment desyncs every later frame, so on any
+        // disagreement resync to what the header says (as the QP path does).
+        for bi in 0..num_blocks {
+            let bstart = header_size + bi * DS2_BLOCK_SIZE;
+            let frames = data[bstart + 2] as usize;
+            if frames == 0 {
+                continue;
             }
-            pkt[DSS_SP_PACKET_SIZE - 2] = 0;
-            swap ^= 1;
-            frame_packets.push(pkt[..DSS_SP_PACKET_SIZE].to_vec());
+            let block_swap = ((data[bstart] >> 7) & 1) as usize;
+            // A swapped frame's first two bytes are the tail of the preceding
+            // 42-byte slot, so its 40-byte read starts two bytes later.
+            let declared = bi * payload_size
+                + (data[bstart + 1] as usize * 2).saturating_sub(DS2_BLOCK_HEADER_SIZE)
+                + 2 * block_swap;
+            if !started || declared != reader.pos || block_swap != reader.swap {
+                reader.resync(&stream, declared, block_swap);
+                started = true;
+            }
+            for _ in 0..frames {
+                frame_packets.push(reader.read_frame(&stream));
+            }
         }
 
         Ok(DemuxedDs2::Sp {
             packets: frame_packets,
             total_frames,
         })
+    }
+}
+
+/// Reads DS2 SP frames from the concatenated block payloads. Frames alternate
+/// between a plain 42-byte slot and a 40-byte slot whose missing byte was
+/// stored in the previous slot ("swap"), so the reader carries that phase.
+#[derive(Default)]
+struct SpFrameReader {
+    pos: usize,
+    swap: usize,
+    swap_byte: u8,
+}
+
+impl SpFrameReader {
+    fn resync(&mut self, stream: &[u8], pos: usize, swap: usize) {
+        self.pos = pos;
+        self.swap = swap;
+        // In a swapped phase the carried byte sits two bytes before the read.
+        if swap != 0 && pos >= 2 {
+            self.swap_byte = stream.get(pos - 2).copied().unwrap_or(0);
+        }
+    }
+
+    fn read_frame(&mut self, stream: &[u8]) -> Vec<u8> {
+        // total_frames counts every declared frame, so the walk can run past the
+        // end of the stream near EOF; clamp both ends and emit zero-padded
+        // packets instead of slicing out of range.
+        let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
+        if self.swap != 0 {
+            let read_size = 40;
+            let end = (self.pos + read_size).min(stream.len());
+            let start = self.pos.min(end);
+            let count = end - start;
+            pkt[3..3 + count].copy_from_slice(&stream[start..end]);
+            self.pos += read_size;
+            for i in (0..DSS_SP_PACKET_SIZE - 2).step_by(2) {
+                pkt[i] = pkt[i + 4];
+            }
+            pkt[DSS_SP_PACKET_SIZE] = 0;
+            pkt[1] = self.swap_byte;
+        } else {
+            let end = (self.pos + DSS_SP_PACKET_SIZE).min(stream.len());
+            let start = self.pos.min(end);
+            let count = end - start;
+            pkt[..count].copy_from_slice(&stream[start..end]);
+            self.pos += DSS_SP_PACKET_SIZE;
+            self.swap_byte = pkt[DSS_SP_PACKET_SIZE - 2];
+        }
+        pkt[DSS_SP_PACKET_SIZE - 2] = 0;
+        self.swap ^= 1;
+        pkt[..DSS_SP_PACKET_SIZE].to_vec()
     }
 }
 
@@ -517,6 +579,117 @@ mod tests {
 
         data.extend_from_slice(&block);
         data
+    }
+
+    /// Lays out `frames` SP frames of pseudo-random bytes as a continuous
+    /// recording and returns its 512-byte blocks, with the per-block headers a
+    /// recorder writes: where the block's first frame starts (byte 1, in 16-bit
+    /// words from the block start), its swap phase (bit 7 of byte 0), and how
+    /// many frames start in the block (byte 2).
+    fn sp_segment_blocks(frames: usize, seed: u32) -> Vec<u8> {
+        let payload = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE;
+        // (declared start, swap phase) for each frame; swapped frames own the
+        // two bytes before their 40-byte read.
+        let (mut pos, mut swap, mut starts) = (0usize, 0usize, Vec::new());
+        for _ in 0..frames {
+            starts.push((pos, swap));
+            pos += if swap == 0 { 42 } else { 40 };
+            swap ^= 1;
+        }
+        let nblocks = pos.div_ceil(payload);
+        let mut rng = seed;
+        let mut bytes = vec![0u8; nblocks * payload];
+        for b in bytes.iter_mut() {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (rng >> 16) as u8;
+        }
+        let mut out = Vec::new();
+        for bi in 0..nblocks {
+            let in_block: Vec<_> = starts
+                .iter()
+                .filter(|(p, s)| (p - 2 * s) / payload == bi)
+                .collect();
+            // A block holding only the tail of the last frame starts no frame of
+            // its own; recorders write it with a frame count of zero.
+            let header = match in_block.first() {
+                Some(&&(first, first_swap)) => {
+                    let offset = first - 2 * first_swap - bi * payload;
+                    [
+                        0x0f | ((first_swap as u8) << 7),
+                        ((offset + DS2_BLOCK_HEADER_SIZE) / 2) as u8,
+                        in_block.len() as u8,
+                        0xff,
+                        0x00,
+                        0xff,
+                    ]
+                }
+                None => [0x0f, 0x03, 0x00, 0xff, 0x00, 0xff],
+            };
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&bytes[bi * payload..(bi + 1) * payload]);
+        }
+        out
+    }
+
+    fn sp_file(blocks: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; DS2_HEADER_SIZE];
+        data[..4].copy_from_slice(b"\x03ds2");
+        data.extend_from_slice(blocks);
+        data
+    }
+
+    fn sp_packets(data: &[u8]) -> Vec<Vec<u8>> {
+        match demux_ds2(data).unwrap() {
+            DemuxedDs2::Sp { packets, .. } => packets,
+            _ => panic!("expected SP"),
+        }
+    }
+
+    #[test]
+    fn sp_demux_resyncs_at_an_edit_point() {
+        // An odd frame count leaves the first recording mid-block and mid-swap,
+        // so reading straight on into the second would misplace every frame.
+        let first = sp_segment_blocks(27, 1);
+        let second = sp_segment_blocks(31, 2);
+        let mut edited = first.clone();
+        edited.extend_from_slice(&second);
+
+        let mut expected = sp_packets(&sp_file(&first));
+        expected.extend(sp_packets(&sp_file(&second)));
+
+        assert_eq!(sp_packets(&sp_file(&edited)), expected);
+    }
+
+    #[test]
+    fn sp_demux_skips_empty_blocks_between_segments() {
+        let first = sp_segment_blocks(25, 3);
+        let second = sp_segment_blocks(19, 4);
+        let mut edited = first.clone();
+        edited.extend_from_slice(&[0x0f, 0x03, 0x00, 0xff, 0x00, 0xff]);
+        edited.extend_from_slice(&[0u8; DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE]);
+        edited.extend_from_slice(&second);
+
+        let mut expected = sp_packets(&sp_file(&first));
+        expected.extend(sp_packets(&sp_file(&second)));
+
+        assert_eq!(sp_packets(&sp_file(&edited)), expected);
+    }
+
+    #[test]
+    fn plain_ds2_magic_accepts_every_known_firmware_generation() {
+        for lead in [0x01u8, 0x03, 0x07, 0x08] {
+            let magic = [lead, b'd', b's', b'2'];
+            assert!(is_plain_ds2_magic(&magic), "lead byte {lead:#04x}");
+        }
+    }
+
+    #[test]
+    fn plain_ds2_magic_rejects_other_containers() {
+        assert!(!is_plain_ds2_magic(b"\x02dss"));
+        assert!(!is_plain_ds2_magic(b"\x03enc"));
+        assert!(!is_plain_ds2_magic(b"\x02ds2"));
+        assert!(!is_plain_ds2_magic(b"ds2"));
+        assert!(!is_plain_ds2_magic(b""));
     }
 
     #[test]

@@ -138,6 +138,26 @@ pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> R
         });
     }
 
+    // Plain DS2 SP: same reason. Only the batch demuxer follows the per-block
+    // headers, which is what keeps frames in sync across the segments a
+    // recorder starts when audio is inserted or overwritten mid-file.
+    if crate::demux::ds2::is_plain_ds2_magic(data) && detect_format(data) == Some(AudioFormat::Ds2Sp) {
+        let packets = match crate::demux::ds2::demux_ds2(data)? {
+            crate::demux::ds2::DemuxedDs2::Sp { packets, .. } => packets,
+            _ => unreachable!("detect_format and demux_ds2 disagree on the DS2 mode"),
+        };
+        let mut decoder = crate::codec::ds2_sp::Ds2SpDecoder::new();
+        let mut samples = Vec::new();
+        for pkt in &packets {
+            samples.extend(decoder.decode_frame(pkt));
+        }
+        return Ok(AudioBuffer {
+            samples,
+            native_rate: AudioFormat::Ds2Sp.native_sample_rate(),
+            format: AudioFormat::Ds2Sp,
+        });
+    }
+
     let mut decoder = DecryptingDecoderStreamer::new(password);
     let mut samples = decoder.push(data)?;
     samples.extend(decoder.finish_lenient()?);
