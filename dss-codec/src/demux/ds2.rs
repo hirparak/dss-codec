@@ -41,7 +41,9 @@ pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
 }
 
 pub(crate) fn detect_ds2_audio_start(data: &[u8]) -> usize {
-    if data.first().copied() != Some(0x07) {
+    // \x07 and \x08 headers may extend past 0x600 (index tables, larger fixed
+    // header); scan for the first audio block instead of assuming the offset.
+    if !matches!(data.first().copied(), Some(0x07) | Some(0x08)) {
         return DS2_HEADER_SIZE;
     }
 
@@ -104,7 +106,7 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// For SP: frame_data is a Vec<Vec<u8>> of packets.
 /// For QP/QP7: frame data is segmented to preserve state resets at cut points.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
-    if data.len() < 4 || !matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") {
+    if data.len() < 4 || !matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2" | b"\x08ds2") {
         return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
     }
 

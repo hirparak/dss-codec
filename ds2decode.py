@@ -219,7 +219,9 @@ def _is_ds2_audio_block_header(block_header):
 
 
 def _detect_ds2_audio_start(data):
-    if data[0] != 0x07:
+    # \x07 and \x08 headers may extend past 0x600 (index tables, larger fixed
+    # header); scan for the first audio block instead of assuming the offset.
+    if data[0] not in (0x07, 0x08):
         return DS2_HEADER_SIZE
 
     scan_end = min(len(data) - DS2_BLOCK_HEADER_SIZE, 0x10000)
@@ -275,7 +277,7 @@ def read_ds2_file(path, password=None):
         from ds2decrypt import decrypt_encrypted_ds2
 
         data = decrypt_encrypted_ds2(data, password)
-    elif data[:4] not in (b'\x03ds2', b'\x01ds2', b'\x07ds2'):
+    elif data[:4] not in (b'\x03ds2', b'\x01ds2', b'\x07ds2', b'\x08ds2'):
         raise ValueError(f"Not a DS2 file: {path}")
 
     header_size = _detect_ds2_audio_start(data)
@@ -283,7 +285,8 @@ def read_ds2_file(path, password=None):
     num_blocks = (len(data) - header_size) // DS2_BLOCK_SIZE
 
     # Detect format from byte 4 of the first block that actually carries frames.
-    # Some \x07ds2 files have a segment/index table before the audio blocks.
+    # Some \x07ds2 files have a segment/index table before the audio blocks;
+    # \x08ds2 files use a larger fixed header (0x1000) instead of 0x600.
     format_type = 0
     for bi in range(num_blocks):
         bstart = header_size + bi * DS2_BLOCK_SIZE

@@ -73,7 +73,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
             _ => AudioFormat::Ds2Sp,
         });
     }
-    if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") && data.len() > 0x604 {
+    if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2" | b"\x08ds2") && data.len() > 0x604 {
         let header_size = detect_ds2_audio_start(data);
         if data.len() <= header_size + 4 {
             return None;
@@ -115,5 +115,22 @@ mod tests {
     fn detect_format_recognizes_encrypted_ds2_sp() {
         let data = make_ds2_like_file(*b"\x03enc", 0);
         assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Sp));
+    }
+
+    #[test]
+    fn detect_format_recognizes_08_header_ds2_qp() {
+        // \x08ds2 files carry a larger file header (0x1000 bytes) before the
+        // audio blocks; detection must scan for the first block header.
+        let mut data = vec![0u8; 0x1000 + 4 * 0x200];
+        data[..4].copy_from_slice(b"\x08ds2");
+        for i in 0..4 {
+            let b = 0x1000 + i * 0x200;
+            data[b] = 0x0f;
+            data[b + 2] = 10;
+            data[b + 3] = 0xff;
+            data[b + 4] = 6;
+            data[b + 5] = 0xff;
+        }
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
     }
 }
