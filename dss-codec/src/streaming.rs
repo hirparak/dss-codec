@@ -100,7 +100,7 @@ impl StreamingDecoder {
             }
 
             return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2" | b"\x08ds2")
             {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
@@ -140,7 +140,7 @@ impl StreamingDecoder {
             }
 
             return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
+                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2" | b"\x08ds2")
             {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
@@ -178,7 +178,7 @@ impl StreamingDecoder {
             let is_dss_prefix = self.prebuffer[1..4] == *b"dss"
                 && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6);
             let is_ds2_prefix =
-                matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2");
+                matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2" | b"\x08ds2");
             if !is_dss_prefix && !is_ds2_prefix {
                 return Err(DecodeError::UnsupportedFormat(
                     self.prebuffer.first().copied().unwrap_or(0),
@@ -447,7 +447,7 @@ impl Default for StreamingDecoder {
 }
 
 fn is_plain_prefix(bytes: &[u8]) -> bool {
-    matches!(bytes.get(..4), Some(b"\x03ds2") | Some(b"\x01ds2") | Some(b"\x07ds2"))
+    matches!(bytes.get(..4), Some(b"\x03ds2") | Some(b"\x01ds2") | Some(b"\x07ds2") | Some(b"\x08ds2"))
         || (bytes.len() >= 4 && bytes[1..4] == *b"dss" && (bytes[0] == 2 || bytes[0] == 3 || bytes[0] == 6))
 }
 

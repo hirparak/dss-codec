@@ -84,13 +84,17 @@ Header size = `version * 512` bytes (v2: 1024, v3: 1536).
 
 | Offset | Size | Description |
 |--------|------|-------------|
-| 0x000 | 4 | Magic: `\x03ds2` |
+| 0x000 | 4 | Magic: `\x03ds2` (variants `\x01ds2`, `\x07ds2`, `\x08ds2` also occur) |
 | 0x004 | 2 | Version (02 00) |
 | 0x006 | 2 | Quality setting (03 00) |
 | 0x00C | 16 | Author ID (alphanumeric string) |
 | 0x026 | 24 | Timestamps (ASCII) |
 | 0x3E6 | 10 | Device serial number |
 | 0x600 | ... | Audio data begins |
+
+Files with magic `\x08ds2` use a larger 0x1000-byte file header; the audio
+block layout is unchanged. The first audio block is located by scanning for
+valid block headers (`detect_ds2_audio_start`).
 
 ### Audio Block Structure (shared DSS/DS2)
 

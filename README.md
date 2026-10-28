@@ -36,6 +36,8 @@ DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
 | `.ds2` mode 0-1 | DS2 SP | 12000 Hz | Header `\x03ds2`, byte4 < 6 |
 | `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `\x03ds2`, byte4 >= 6 |
 
+DS2 files with magic `\x01ds2`, `\x07ds2` or `\x08ds2` are accepted as well (`\x08ds2` files use a larger 0x1000-byte file header; the audio block layout is identical).
+
 Encrypted DS2 files with header `\x03enc` are also supported when a password is provided, and can be either decoded directly or normalized back to a plain `.ds2` container with `--decrypt`.
 
 ## Project Structure
