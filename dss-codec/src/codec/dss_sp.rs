@@ -123,6 +123,9 @@ pub struct DssSpDecoder {
     repack: bool,
     repack_pulse_tbl: bool,
     frame_idx: usize,
+    variable_rate: bool,
+    noise_frame: bool,
+    noise_seed: u16,
 }
 
 impl Default for DssSpDecoder {
@@ -133,6 +136,10 @@ impl Default for DssSpDecoder {
 
 impl DssSpDecoder {
     pub fn new() -> Self {
+        Self::with_variable_rate(false)
+    }
+
+    pub fn with_variable_rate(variable_rate: bool) -> Self {
         Self {
             excitation: vec![0; 288 + 6],
             history: vec![0; SHIFT_IN_OFF + SHIFT_IN_LEN],
@@ -151,6 +158,9 @@ impl DssSpDecoder {
             repack: false,
             repack_pulse_tbl: false,
             frame_idx: 0,
+            variable_rate,
+            noise_frame: false,
+            noise_seed: 0,
         }
     }
 
@@ -161,12 +171,16 @@ impl DssSpDecoder {
         self.convert_coeffs();
 
         for j in 0..SUBFRAMES {
-            self.gen_exc(pitch_lag[j], ADAPTIVE_GAIN[sf_adaptive_gain[j]] as i64);
-            self.add_pulses(&subframes[j]);
-            self.update_buf();
+            if self.noise_frame {
+                self.gen_noise(NOISE_GAIN[sf_adaptive_gain[j]] as i64);
+            } else {
+                self.gen_exc(pitch_lag[j], ADAPTIVE_GAIN[sf_adaptive_gain[j]] as i64);
+                self.add_pulses(&subframes[j]);
+                self.update_buf();
 
-            for i in 0..SUBFRAME_SIZE {
-                self.vector_buf[i] = self.history[SUBFRAME_SIZE - i];
+                for i in 0..SUBFRAME_SIZE {
+                    self.vector_buf[i] = self.history[SUBFRAME_SIZE - i];
+                }
             }
 
             let shift = 13 - self.shift_amount;
@@ -219,6 +233,7 @@ impl DssSpDecoder {
         };
 
         let mut reader = BitstreamReader::new(pkt);
+        self.noise_frame = self.variable_rate && reader.read_bits(1) == 0;
 
         // Reflection coefficient indices: 2x5 + 6x4 + 6x3 = 52 bits
         let mut filter_idx = Vec::with_capacity(14);
@@ -228,8 +243,16 @@ impl DssSpDecoder {
         for _ in 0..6 {
             filter_idx.push(reader.read_bits(4) as usize);
         }
-        for _ in 0..6 {
+        for _ in 0..5 {
             filter_idx.push(reader.read_bits(3) as usize);
+        }
+        filter_idx.push(reader.read_bits(if self.variable_rate { 2 } else { 3 }) as usize);
+
+        if self.noise_frame {
+            let noise_gain = (0..SUBFRAMES)
+                .map(|_| reader.read_bits(5) as usize)
+                .collect();
+            return (filter_idx, noise_gain, Vec::new(), Vec::new());
         }
 
         // Per-subframe: 5 + 31 + 6 + 7*3 = 63 bits x 4 = 252 bits
@@ -344,6 +367,16 @@ impl DssSpDecoder {
     fn unpack_filter(&mut self, filter_idx: &[usize]) {
         for i in 0..14 {
             self.lpc_filter[i] = FILTER_CB[i][filter_idx[i]] as i64;
+        }
+        if self.variable_rate {
+            self.lpc_filter[13] = VR_FILTER_CB13[filter_idx[13]] as i64;
+        }
+    }
+
+    fn gen_noise(&mut self, gain: i64) {
+        for i in 0..SUBFRAME_SIZE {
+            self.noise_seed = self.noise_seed.wrapping_mul(0x209).wrapping_add(0x103);
+            self.vector_buf[i] = (self.noise_seed as i16 as i64 * gain) >> 14;
         }
     }
 
@@ -689,4 +722,168 @@ fn apply_post_lpc(vector: &mut [i64; SUBFRAME_SIZE], mut etat: i64) -> i64 {
         }
     }
     etat
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILTER_IDX: [usize; 14] = [3, 17, 1, 2, 3, 4, 5, 15, 1, 2, 3, 4, 7, 2];
+    const VR_FILTER_BITS: [u32; 14] = [5, 5, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 2];
+
+    fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        for &(value, width) in fields {
+            for k in (0..width).rev() {
+                bits.push((value >> k) & 1 != 0);
+            }
+        }
+        let mut pkt = vec![0u8; 42];
+        for (n, &bit) in bits.iter().enumerate() {
+            if bit {
+                let pos = 15 - n % 16;
+                pkt[2 * (n / 16) + pos / 8] |= 1 << (pos % 8);
+            }
+        }
+        pkt
+    }
+
+    fn vr_packet(type_bit: u32, tail: &[(u32, u32)]) -> Vec<u8> {
+        let mut fields = vec![(type_bit, 1)];
+        fields.extend(FILTER_IDX.iter().zip(VR_FILTER_BITS).map(|(&i, b)| (i as u32, b)));
+        fields.extend_from_slice(tail);
+        pack(&fields)
+    }
+
+    fn noise_packet(gains: [u32; 4]) -> Vec<u8> {
+        vr_packet(0, &gains.map(|g| (g, 5)))
+    }
+
+    fn long_packet() -> Vec<u8> {
+        let mut tail = Vec::new();
+        for sf in 0..4 {
+            tail.extend([(10 + sf, 5), (1000 + 77 * sf, 31), (40, 6)]);
+            tail.extend((1..=7).map(|v| (v, 3)));
+        }
+        tail.push((50, 24));
+        vr_packet(1, &tail)
+    }
+
+    #[test]
+    fn test_noise_frame_reads_filter_and_four_gains() {
+        let pkt = noise_packet([1, 31, 12, 17]);
+        assert_eq!(pkt[8], 0);
+        assert!(pkt[10..].iter().all(|&b| b == 0));
+
+        let mut decoder = DssSpDecoder::with_variable_rate(true);
+        let (filter_idx, gains, pitch_lag, subframes) = decoder.unpack_coeffs(&pkt);
+        assert!(decoder.noise_frame);
+        assert_eq!(filter_idx, FILTER_IDX);
+        assert_eq!(gains, [1, 31, 12, 17]);
+        assert!(pitch_lag.is_empty());
+        assert!(subframes.is_empty());
+
+        let mut noise = DssSpDecoder::with_variable_rate(true);
+        noise.decode_frame(&pkt);
+        let mut long = DssSpDecoder::with_variable_rate(true);
+        long.decode_frame(&long_packet());
+        assert_eq!(noise.lpc_filter, long.lpc_filter);
+    }
+
+    #[test]
+    fn test_fixed_rate_decoder_ignores_type_bit() {
+        let pkt = noise_packet([1, 31, 0, 17]);
+        let mut decoder = DssSpDecoder::new();
+        let (filter_idx, gains, pitch_lag, subframes) = decoder.unpack_coeffs(&pkt);
+        assert!(!decoder.noise_frame);
+        assert_eq!(filter_idx[0], FILTER_IDX[0] >> 1);
+        assert_eq!(gains.len(), SUBFRAMES);
+        assert_eq!(pitch_lag.len(), SUBFRAMES);
+        assert_eq!(subframes.len(), SUBFRAMES);
+    }
+
+    #[test]
+    fn test_variable_rate_reads_two_bit_last_filter_index() {
+        let pkt = vec![0xff; 42];
+        let mut decoder = DssSpDecoder::with_variable_rate(true);
+        let (filter_idx, gains, pitch_lag, subframes) = decoder.unpack_coeffs(&pkt);
+        assert!(!decoder.noise_frame);
+        assert_eq!(filter_idx[13], 3);
+        assert_eq!(gains.len(), SUBFRAMES);
+        assert_eq!(pitch_lag.len(), SUBFRAMES);
+        assert_eq!(subframes.len(), SUBFRAMES);
+
+        let mut fixed = DssSpDecoder::new();
+        assert_eq!(fixed.unpack_coeffs(&pkt).0[13], 7);
+    }
+
+    #[test]
+    fn test_variable_rate_uses_own_last_filter_table() {
+        let mut idx = [0usize; 14];
+        for (i, coeff) in [-8166, -2419, 1997, 6705].into_iter().enumerate() {
+            idx[13] = i;
+            let mut variable = DssSpDecoder::with_variable_rate(true);
+            variable.unpack_filter(&idx);
+            let mut fixed = DssSpDecoder::new();
+            fixed.unpack_filter(&idx);
+            assert_eq!(variable.lpc_filter[13], coeff);
+            assert_eq!(fixed.lpc_filter[13], FILTER_CB[13][i] as i64);
+            assert_ne!(variable.lpc_filter[13], fixed.lpc_filter[13]);
+            assert_eq!(variable.lpc_filter[..13], fixed.lpc_filter[..13]);
+        }
+    }
+
+    #[test]
+    fn test_gen_noise_follows_seed() {
+        let mut decoder = DssSpDecoder::with_variable_rate(true);
+        decoder.gen_noise(84);
+        assert_eq!(decoder.vector_buf[..8], [1, 21, -66, 128, -117, -39, -28, -42]);
+        let first = decoder.vector_buf;
+        decoder.gen_noise(84);
+        assert_ne!(decoder.vector_buf, first);
+        decoder.gen_noise(0);
+        assert!(decoder.vector_buf.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_noise_gain_table_matches_ffmpeg() {
+        assert_eq!(
+            NOISE_GAIN,
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                16, 17, 18, 20, 22, 24, 26, 28, 30, 34, 40, 46, 52, 60, 72, 84,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_noise_frame_keeps_pitch_history() {
+        let mut decoder = DssSpDecoder::with_variable_rate(true);
+        decoder.decode_frame(&long_packet());
+        let history = decoder.history.clone();
+        assert!(history.iter().any(|&v| v != 0));
+        assert_eq!(decoder.noise_seed, 0);
+
+        assert_eq!(decoder.decode_frame(&noise_packet([31, 31, 31, 31])).len(), 264);
+        assert_eq!(decoder.history, history);
+        let seed = decoder.noise_seed;
+        assert_ne!(seed, 0);
+
+        decoder.decode_frame(&long_packet());
+        assert_ne!(decoder.history, history);
+        assert_eq!(decoder.noise_seed, seed);
+
+        decoder.decode_frame(&noise_packet([1, 1, 1, 1]));
+        assert_ne!(decoder.noise_seed, seed);
+    }
+
+    #[test]
+    fn test_short_packet_slices_decode() {
+        let pkt = noise_packet([5, 6, 7, 8]);
+        let whole = DssSpDecoder::with_variable_rate(true).decode_frame(&pkt);
+        let mut decoder = DssSpDecoder::with_variable_rate(true);
+        assert_eq!(decoder.decode_frame(&pkt[..10]), whole);
+        assert_eq!(DssSpDecoder::with_variable_rate(true).decode_frame(&pkt[..9]).len(), 264);
+        assert_eq!(DssSpDecoder::new().decode_frame(&pkt[..9]).len(), 264);
+    }
 }

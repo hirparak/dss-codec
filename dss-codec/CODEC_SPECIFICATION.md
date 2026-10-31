@@ -833,7 +833,7 @@ deemph_state:        f64    // De-emphasis filter state
 For each subframe (identical structure to DS2 SP but with different sizes):
 
 5. **Adaptive excitation** (same as SP but subframe_size=64, max_pitch=300)
-6. **Fixed codebook excitation**: `decode_combinatorial_index(cb_idx, 64, 11)` — 11 pulses, 64 positions. A `cb_idx >= C(64,11)` (only produced by misaligned cut-file frames) triggers the overflow fallback described below instead of the normal decode.
+6. **Fixed codebook excitation**: `decode_combinatorial_index(cb_idx, 64, 11)`, 11 pulses at 64 positions. The decoder first clamps a `cb_idx >= C(64,11)` to `C(64,11) - 1`, as described below.
 7. **Total excitation**: `excitation[i] = gp * adaptive_exc[i] + fixed_exc[i]`
 8. **Lattice synthesis**: `output = lattice_synthesis(excitation, coeffs, lattice_state)`
 9. **Update pitch memory**
@@ -884,8 +884,9 @@ per subframe (x4):              93 bits = 372 bits   (identical to QP:
 Total: 1 + 75 + 372 = 448 bits = 56 bytes
 ```
 
-Decoding is identical to the QP long frame (including the combinatorial overflow
-fallback) after consuming the mode flag and using the QP7 reflection allocation.
+Decoding is identical to the QP long frame (including the clamp of an index of
+C(64,11) or more) after consuming the mode flag and using the QP7 reflection
+allocation.
 
 **Short record (12 bytes, mode = 0)** - comfort noise / low energy:
 
@@ -938,24 +939,17 @@ def decode_combinatorial_index(index, n, k):
 
 The positions are in descending order because the combinatorial encoding maps the k-subset {p_k > p_{k-1} > ... > p_1} to `sum(C(p_i, i))`. The decode naturally produces positions from largest to smallest.
 
-#### QP Overflow Fallback (cut files)
+#### QP index clamp
 
 A valid QP fixed-codebook index is always `< C(64, 11) = 743,595,781,824`.
-Misaligned frames in NCH selective-extraction cut files can carry an index at
-or above that bound, which the normal decode cannot represent. The reference
-decoder does not reject it; it drops the first pulse and places the remaining
-ten at fixed descending positions. Reproduce that exactly (verified
-sample-exact against the NCH decodes):
+The 40-bit field can hold a larger value, which the normal decode cannot
+represent. The decoder clamps such an index to `C(64, 11) - 1`, which puts
+the 11 pulses at positions 63 down to 53.
 
 ```python
 QP_COMB_MAX = 743_595_781_824   # C(64, 11)
 
-if cb_idx >= QP_COMB_MAX:
-    # pulse 0 is at position 64 (out of range 0..63) and is dropped by the
-    # `pos < 64` guard in the pulse-placement loop; pulses 1..10 land at 9..0.
-    positions = [64, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-else:
-    positions = decode_combinatorial_index(cb_idx, 64, 11)
+positions = decode_combinatorial_index(min(cb_idx, QP_COMB_MAX - 1), 64, 11)
 ```
 
 ### Binomial Coefficient

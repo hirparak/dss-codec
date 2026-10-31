@@ -67,7 +67,7 @@ fn main() {
         bit_depth: cli.bits,
         channels: cli.channels,
     };
-    let password = resolve_password(cli.password.as_deref());
+    let password = resolve_password(cli.password.as_deref(), env::var("DSS_CODEC_PASSWORD").ok());
 
     for input_path in &cli.input {
         let output_path = if cli.decrypt {
@@ -128,14 +128,9 @@ fn main() {
             ) {
                 Ok(buf) => {
                     if !cli.quiet {
-                        let duration = buf.samples.len() as f64 / buf.native_rate as f64;
                         eprintln!(
-                            "  {} -> {} ({:.1}s, {} Hz, {:?})",
-                            input_path.display(),
-                            output_path.display(),
-                            duration,
-                            buf.native_rate,
-                            buf.format,
+                            "{}",
+                            summary(input_path, &output_path, &buf, config.sample_rate)
                         );
                     }
                 }
@@ -148,11 +143,39 @@ fn main() {
     }
 }
 
-fn resolve_password(cli_password: Option<&str>) -> Option<Vec<u8>> {
+fn resolve_password(cli_password: Option<&str>, env_password: Option<String>) -> Option<Vec<u8>> {
     cli_password
         .map(str::as_bytes)
         .map(|bytes| bytes.to_vec())
-        .or_else(|| env::var("DSS_CODEC_PASSWORD").ok().map(|value| value.into_bytes()))
+        .or_else(|| env_password.map(|value| value.into_bytes()))
+}
+
+fn summary(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    buf: &dss_codec::AudioBuffer,
+    rate: Option<u32>,
+) -> String {
+    let rate = rate.unwrap_or(buf.native_rate);
+    let duration = buf.samples.len() as f64 / rate as f64;
+    let formats = if buf.parts.len() > 1 {
+        let formats: Vec<String> = buf
+            .parts
+            .iter()
+            .map(|part| format!("{:?}", part.format))
+            .collect();
+        formats.join(" then ")
+    } else {
+        format!("{:?}", buf.format)
+    };
+    format!(
+        "  {} -> {} ({:.1}s, {} Hz, {})",
+        input.display(),
+        output.display(),
+        duration,
+        rate,
+        formats,
+    )
 }
 
 fn make_output_path(input: &PathBuf, output_dir: Option<&std::path::Path>, ext: &str) -> PathBuf {
@@ -211,30 +234,87 @@ fn print_info(path: &PathBuf, _quiet: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_decrypt_output_path, resolve_password};
-    use std::env;
-    use std::path::PathBuf;
+    use super::{make_decrypt_output_path, resolve_password, summary};
+    use dss_codec::demux::AudioFormat;
+    use dss_codec::{AudioBuffer, AudioPart};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn resolve_password_prefers_cli_over_env() {
-        unsafe {
-            env::set_var("DSS_CODEC_PASSWORD", "env-secret");
-        }
-        assert_eq!(resolve_password(Some("cli-secret")), Some(b"cli-secret".to_vec()));
-        unsafe {
-            env::remove_var("DSS_CODEC_PASSWORD");
-        }
+        assert_eq!(
+            resolve_password(Some("cli-secret"), Some("env-secret".to_string())),
+            Some(b"cli-secret".to_vec())
+        );
     }
 
     #[test]
     fn resolve_password_falls_back_to_env() {
-        unsafe {
-            env::set_var("DSS_CODEC_PASSWORD", "env-secret");
-        }
-        assert_eq!(resolve_password(None), Some(b"env-secret".to_vec()));
-        unsafe {
-            env::remove_var("DSS_CODEC_PASSWORD");
-        }
+        assert_eq!(
+            resolve_password(None, Some("env-secret".to_string())),
+            Some(b"env-secret".to_vec())
+        );
+    }
+
+    #[test]
+    fn resolve_password_is_none_without_cli_or_env() {
+        assert_eq!(resolve_password(None, None), None);
+    }
+
+    #[test]
+    fn summary_gives_the_output_rate_and_duration() {
+        let buf = AudioBuffer {
+            samples: vec![0.0; 288000],
+            native_rate: 16000,
+            format: AudioFormat::Ds2Qp,
+            parts: Vec::new(),
+        };
+        let input = Path::new("in.ds2");
+        let output = Path::new("out.wav");
+        assert_eq!(
+            summary(input, output, &buf, Some(12000)),
+            "  in.ds2 -> out.wav (24.0s, 12000 Hz, Ds2Qp)"
+        );
+        let buf = AudioBuffer {
+            samples: vec![0.0; 384000],
+            ..buf
+        };
+        assert_eq!(
+            summary(input, output, &buf, None),
+            "  in.ds2 -> out.wav (24.0s, 16000 Hz, Ds2Qp)"
+        );
+    }
+
+    #[test]
+    fn summary_names_the_format_of_every_part() {
+        let part = |start, format: AudioFormat| AudioPart {
+            start,
+            len: 384000,
+            rate: 16000,
+            format,
+            block_format: 0,
+        };
+        let buf = AudioBuffer {
+            samples: vec![0.0; 1152000],
+            native_rate: 12000,
+            format: AudioFormat::Ds2Sp,
+            parts: vec![
+                part(0, AudioFormat::Ds2Sp),
+                part(384000, AudioFormat::Ds2Qp),
+                part(768000, AudioFormat::Ds2Sp),
+            ],
+        };
+        assert_eq!(
+            summary(Path::new("in.ds2"), Path::new("out.wav"), &buf, Some(16000)),
+            "  in.ds2 -> out.wav (72.0s, 16000 Hz, Ds2Sp then Ds2Qp then Ds2Sp)"
+        );
+        let buf = AudioBuffer {
+            parts: buf.parts[..1].to_vec(),
+            ..buf
+        };
+        assert_eq!(
+            summary(Path::new("in.ds2"), Path::new("out.wav"), &buf, Some(16000)),
+            "  in.ds2 -> out.wav (72.0s, 16000 Hz, Ds2Sp)"
+        );
     }
 
     #[test]

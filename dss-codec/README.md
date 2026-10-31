@@ -8,11 +8,12 @@ Replaces the Wine + Olympus DirectShow + NCH Switch pipeline with a standalone b
 
 | Format | Extension | Sample Rate | Quality | Bit Rate |
 |--------|-----------|-------------|---------|----------|
-| DSS SP | `.dss` | 11025 Hz | Standard | ~13.7 kbps |
-| DS2 SP | `.ds2` (mode 0) | 12000 Hz | Standard | ~13.7 kbps |
+| DSS SP | `.dss` | 12000 Hz | Standard | ~13.7 kbps |
+| DS2 SP | `.ds2` (mode 0-1) | 12000 Hz | Standard | ~13.7 kbps |
 | DS2 QP | `.ds2` (mode 6) | 16000 Hz | Quality | ~28 kbps |
 
-Format is auto-detected from the file header.
+Format is auto-detected from the file header. DS2 SP files hold DSS SP
+frames and decode the same way. LP files fail with `UnsupportedCodec`.
 
 ## Installation
 

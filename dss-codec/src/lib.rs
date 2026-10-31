@@ -25,6 +25,23 @@ pub struct AudioBuffer {
     pub native_rate: u32,
     /// Detected format
     pub format: AudioFormat,
+    /// Runs of samples that one block format produced, in order
+    pub parts: Vec<AudioPart>,
+}
+
+/// A run of samples that one block format produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPart {
+    /// Index of the part's first sample in the buffer
+    pub start: usize,
+    /// Number of samples in the part
+    pub len: usize,
+    /// Sample rate of the part's samples
+    pub rate: u32,
+    /// Format of the part's frames
+    pub format: AudioFormat,
+    /// Format byte of the part's audio blocks
+    pub block_format: u8,
 }
 
 /// Lightweight file/container inspection result.
@@ -119,25 +136,6 @@ pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
 
 /// Decode raw file bytes to an AudioBuffer, optionally decrypting encrypted DS2 input first.
 pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> Result<AudioBuffer> {
-    // DSS SP: use the block-aware batch demuxer, which handles mid-stream
-    // compact (short/padded) blocks. The streaming demuxer concatenates full
-    // block payloads and mis-reads compact-block padding as audio.
-    if detect_format(data) == Some(AudioFormat::DssSp) {
-        let (packets, _total) = crate::demux::dss::demux_dss(data)?;
-        let mut decoder = crate::codec::dss_sp::DssSpDecoder::new();
-        let mut samples = Vec::new();
-        for pkt in &packets {
-            for s in decoder.decode_frame(pkt) {
-                samples.push(s as f64);
-            }
-        }
-        return Ok(AudioBuffer {
-            samples,
-            native_rate: AudioFormat::DssSp.native_sample_rate(),
-            format: AudioFormat::DssSp,
-        });
-    }
-
     let mut decoder = DecryptingDecoderStreamer::new(password);
     let mut samples = decoder.push(data)?;
     samples.extend(decoder.finish_lenient()?);
@@ -151,6 +149,7 @@ pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> R
         samples,
         native_rate: format.native_sample_rate(),
         format,
+        parts: decoder.parts().to_vec(),
     })
 }
 
@@ -173,8 +172,27 @@ pub fn decode_and_write_with_password(
 
     let target_rate = config.sample_rate.unwrap_or(buf.native_rate);
 
-    if target_rate != buf.native_rate {
+    if buf.parts.len() > 1 {
+        let mut samples = Vec::new();
+        for part in &mut buf.parts {
+            let part_samples = &buf.samples[part.start..part.start + part.len];
+            let part_samples = if part.rate == target_rate {
+                part_samples.to_vec()
+            } else {
+                resample(part_samples, part.rate, target_rate)?
+            };
+            part.start = samples.len();
+            part.len = part_samples.len();
+            part.rate = target_rate;
+            samples.extend(part_samples);
+        }
+        buf.samples = samples;
+    } else if target_rate != buf.native_rate {
         buf.samples = resample(&buf.samples, buf.native_rate, target_rate)?;
+        for part in &mut buf.parts {
+            part.len = buf.samples.len();
+            part.rate = target_rate;
+        }
     }
 
     write_wav(
@@ -198,6 +216,8 @@ mod inspection_tests {
         data[..4].copy_from_slice(&ENCRYPTED_MAGIC);
         data[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + 2]
             .copy_from_slice(&mode.to_le_bytes());
+        data[0x602] = 1;
+        data[0x603] = 0xff;
         data[0x604] = format_type;
         data
     }
@@ -222,5 +242,36 @@ mod inspection_tests {
             inspect_bytes(&encrypted_ds2(99, 0)).unwrap().encryption,
             EncryptionInfo::EncryptedUnknown(99)
         );
+    }
+
+    #[test]
+    fn inspect_bytes_reads_an_encrypted_file_as_its_plain_twin() {
+        for (first, byte3, frames, format) in [
+            (2u8, 0xffu8, 0u8, AudioFormat::Ds2Qp),
+            (4, 0xff, 0, AudioFormat::Ds2Qp),
+            (0, 0xff, 0, AudioFormat::Ds2Qp),
+            (3, 0xff, 1, AudioFormat::Ds2Qp),
+            (8, 0xff, 1, AudioFormat::Ds2Qp),
+            (7, 0, 1, AudioFormat::Ds2Qp),
+            (2, 0, 1, AudioFormat::Ds2Qp),
+        ] {
+            let mut data = encrypted_ds2(1, first);
+            data[0x602] = frames;
+            data[0x603] = byte3;
+            data.resize(0xa00, 0);
+            data[0x802] = 1;
+            data[0x803] = 0xff;
+            data[0x804] = 6;
+            let mut plain = data.clone();
+            plain[..4].copy_from_slice(b"\x03ds2");
+            assert_eq!(
+                detect_format(&plain),
+                Some(format),
+                "plain, {first} then QP"
+            );
+            let info = inspect_bytes(&data).unwrap();
+            assert_eq!(info.format, format, "{first} then QP");
+            assert_eq!(info.native_rate(), 16000);
+        }
     }
 }

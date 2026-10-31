@@ -152,6 +152,15 @@ pub const ADAPTIVE_GAIN: [i32; 32] = [
     3194, 3323, 3451, 3580, 3709, 3838, 3967, 4096,
 ];
 
+/// Last reflection coefficient table for variable rate SP (2-bit, 4 entries)
+pub const VR_FILTER_CB13: [i16; 4] = [-8166, -2419, 1997, 6705];
+
+/// Noise gain table for variable rate SP short frames (5-bit, 32 entries)
+pub const NOISE_GAIN: [i32; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 20, 22, 24, 26, 28, 30, 34, 40, 46, 52, 60, 72, 84,
+];
+
 /// Sinc interpolation coefficients for the 11:12 decimation, 12000 -> 11000 Hz
 pub const SINC: [i32; 67] = [
     262, 293, 323, 348, 356, 336, 269, 139,

@@ -19,6 +19,7 @@ const BLOCK_BYTE_INDEX_OFFSET: usize = 0x128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMode {
+    Unstated = 0,
     Aes128 = 1,
     Aes256 = 2,
 }
@@ -97,10 +98,10 @@ impl EncryptedDs2BlockDecryptor {
             }
 
             let descriptor = parse_decrypt_descriptor(&self.header_buf)?;
-            let saved_state = build_saved_state(&self.password, &descriptor)?;
+            let (saved_state, key_mode) = build_saved_state(&self.password, &descriptor)?;
 
             self.saved_state = Some(saved_state);
-            self.key_mode = Some(descriptor.key_mode);
+            self.key_mode = Some(key_mode);
 
             let mut plain_header = self.header_buf[..DS2_HEADER_SIZE].to_vec();
             plain_header[..4].copy_from_slice(&PLAIN_MAGIC);
@@ -143,6 +144,15 @@ impl EncryptedDs2BlockDecryptor {
         }
 
         Ok(Vec::new())
+    }
+
+    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<u8>> {
+        if let (Some(saved_state), Some(key_mode)) = (&self.saved_state, self.key_mode) {
+            let mut record = std::mem::take(&mut self.block_buf);
+            decrypt_partial_record(saved_state, key_mode, &mut record)?;
+            return Ok(record);
+        }
+        self.finish()
     }
 }
 
@@ -226,6 +236,7 @@ pub fn parse_decrypt_descriptor(data: &[u8]) -> Result<DecryptDescriptor> {
         .ok_or_else(|| DecodeError::EncryptedDs2("missing decrypt descriptor".to_string()))?;
 
     let key_mode = match u16::from_le_bytes(raw[0..2].try_into().unwrap()) {
+        0 => KeyMode::Unstated,
         1 => KeyMode::Aes128,
         2 => KeyMode::Aes256,
         mode => {
@@ -261,14 +272,14 @@ pub fn decrypt_encrypted_ds2(data: &[u8], password: &[u8]) -> Result<Vec<u8>> {
     }
 
     let descriptor = parse_decrypt_descriptor(data)?;
-    let saved_state = build_saved_state(password, &descriptor)?;
+    let (saved_state, key_mode) = build_saved_state(password, &descriptor)?;
 
     let mut out = data.to_vec();
     out[..4].copy_from_slice(&PLAIN_MAGIC);
 
     let mut offset = DS2_HEADER_SIZE;
     while offset + DS2_BLOCK_SIZE <= out.len() {
-        decrypt_record_in_place(&saved_state, descriptor.key_mode, &mut out[offset..offset + DS2_BLOCK_SIZE])?;
+        decrypt_record_in_place(&saved_state, key_mode, &mut out[offset..offset + DS2_BLOCK_SIZE])?;
         offset += DS2_BLOCK_SIZE;
     }
 
@@ -291,7 +302,7 @@ pub fn debug_decrypt_block(
     }
 
     let descriptor = parse_decrypt_descriptor(data)?;
-    let saved_state = build_saved_state(password, &descriptor)?;
+    let (saved_state, key_mode) = build_saved_state(password, &descriptor)?;
 
     let block_offset = DS2_HEADER_SIZE + block_index * DS2_BLOCK_SIZE;
     let block = data
@@ -305,7 +316,7 @@ pub fn debug_decrypt_block(
 
     let mut state_for_core = saved_state.clone();
     let mut core_body = swapped_body.clone();
-    decrypt_body_self_rekey(&mut core_body, &mut state_for_core, descriptor.key_mode)?;
+    decrypt_body_self_rekey(&mut core_body, &mut state_for_core, key_mode)?;
 
     final_block[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_HEADER_SIZE + TRANSFORMED_BODY_SIZE]
         .copy_from_slice(&core_body);
@@ -319,7 +330,7 @@ pub fn debug_decrypt_block(
     second_decrypted_16.copy_from_slice(&core_body[16..32]);
 
     Ok(DebugDecryptTrace {
-        mode: descriptor.key_mode,
+        mode: key_mode,
         expected_check_word: descriptor.expected_check_word,
         saved_state: saved_state.blob.to_vec(),
         swapped_body,
@@ -330,29 +341,41 @@ pub fn debug_decrypt_block(
     })
 }
 
-fn build_saved_state(password: &[u8], descriptor: &DecryptDescriptor) -> Result<PayloadDecryptState> {
-    let (derived_key, computed_check_word) = match descriptor.key_mode {
-        KeyMode::Aes128 => {
-            let (key, check) = derive_key_128(password, &descriptor.aux_16)?;
-            (key.to_vec(), check)
-        }
-        KeyMode::Aes256 => {
-            let (key, check) = derive_key_256(password, &descriptor.aux_16)?;
-            (key.to_vec(), check)
-        }
+fn build_saved_state(
+    password: &[u8],
+    descriptor: &DecryptDescriptor,
+) -> Result<(PayloadDecryptState, KeyMode)> {
+    let modes = match descriptor.key_mode {
+        KeyMode::Unstated => &[KeyMode::Aes128, KeyMode::Aes256][..],
+        KeyMode::Aes128 => &[KeyMode::Aes128][..],
+        KeyMode::Aes256 => &[KeyMode::Aes256][..],
     };
-
-    if computed_check_word != descriptor.expected_check_word {
-        return Err(DecodeError::EncryptedDs2(format!(
-            "password rejected by descriptor check: expected 0x{:04x}, computed 0x{:04x}",
-            descriptor.expected_check_word, computed_check_word
-        )));
+    let mut computed = Vec::new();
+    for &mode in modes {
+        let (derived_key, computed_check_word) = match mode {
+            KeyMode::Aes256 => {
+                let (key, check) = derive_key_256(password, &descriptor.aux_16)?;
+                (key.to_vec(), check)
+            }
+            _ => {
+                let (key, check) = derive_key_128(password, &descriptor.aux_16)?;
+                (key.to_vec(), check)
+            }
+        };
+        if computed_check_word == descriptor.expected_check_word {
+            let mut state = PayloadDecryptState::default();
+            state.set_block_byte_index(0x10);
+            aes_expand_key(&mut state, &derived_key)?;
+            return Ok((state, mode));
+        }
+        computed.push(format!("0x{computed_check_word:04x}"));
     }
 
-    let mut state = PayloadDecryptState::default();
-    state.set_block_byte_index(0x10);
-    aes_expand_key(&mut state, &derived_key)?;
-    Ok(state)
+    Err(DecodeError::EncryptedDs2(format!(
+        "password rejected by descriptor check: expected 0x{:04x}, computed {}",
+        descriptor.expected_check_word,
+        computed.join(" and ")
+    )))
 }
 
 fn decrypt_record_in_place(
@@ -369,6 +392,30 @@ fn decrypt_record_in_place(
     }
 
     let body = &mut record[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_HEADER_SIZE + TRANSFORMED_BODY_SIZE];
+    swap_adjacent_bytes(body);
+
+    let mut state = saved_state.clone();
+    decrypt_body_self_rekey(body, &mut state, key_mode)?;
+
+    swap_adjacent_bytes(body);
+    Ok(())
+}
+
+fn decrypt_partial_record(
+    saved_state: &PayloadDecryptState,
+    key_mode: KeyMode,
+    record: &mut Vec<u8>,
+) -> Result<()> {
+    if record.len() <= DS2_BLOCK_HEADER_SIZE {
+        return Ok(());
+    }
+    let held = (record.len() - DS2_BLOCK_HEADER_SIZE).min(TRANSFORMED_BODY_SIZE);
+    let body_len = held - held % 16;
+    if held < TRANSFORMED_BODY_SIZE {
+        record.truncate(DS2_BLOCK_HEADER_SIZE + body_len);
+    }
+
+    let body = &mut record[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_HEADER_SIZE + body_len];
     swap_adjacent_bytes(body);
 
     let mut state = saved_state.clone();
@@ -444,6 +491,11 @@ fn decrypt_body_self_rekey(
                 KeyMode::Aes256 => {
                     let rekey = state.rekey_source_256();
                     aes_expand_key(state, &rekey)?;
+                }
+                KeyMode::Unstated => {
+                    return Err(DecodeError::EncryptedDs2(
+                        "key size not resolved".to_string(),
+                    ))
                 }
             }
             state.set_block_byte_index(0);
@@ -768,5 +820,165 @@ mod tests {
         let _ = decryptor.push(&[0u8; 10]).unwrap();
         let err = decryptor.finish().unwrap_err();
         assert!(matches!(err, DecodeError::Truncated(_)));
+    }
+
+    fn encrypted_qp_file(blocks: usize) -> Vec<u8> {
+        let mut data = vec![0u8; DS2_HEADER_SIZE + blocks * DS2_BLOCK_SIZE];
+        data[..4].copy_from_slice(&ENCRYPTED_MAGIC);
+        data[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + DECRYPT_DESCRIPTOR_SIZE]
+            .copy_from_slice(&DESC_128);
+        for (i, block) in data[DS2_HEADER_SIZE..]
+            .chunks_mut(DS2_BLOCK_SIZE)
+            .enumerate()
+        {
+            block[..DS2_BLOCK_HEADER_SIZE].copy_from_slice(&[0, 3, 9, 0xff, 6, 0xff]);
+            for (j, byte) in block[DS2_BLOCK_HEADER_SIZE..].iter_mut().enumerate() {
+                *byte = (j as u8).wrapping_mul(29).wrapping_add(i as u8);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn key_size_0_tries_aes128_then_aes256() {
+        for (desc, mode) in [(DESC_128, KeyMode::Aes128), (DESC_256, KeyMode::Aes256)] {
+            let mut stated = encrypted_qp_file(3);
+            stated[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + DECRYPT_DESCRIPTOR_SIZE]
+                .copy_from_slice(&desc);
+            let mut unstated = stated.clone();
+            unstated[DECRYPT_DESCRIPTOR_OFFSET] = 0;
+
+            let desc = parse_decrypt_descriptor(&unstated).unwrap();
+            assert_eq!(desc.key_mode, KeyMode::Unstated);
+            assert_eq!(build_saved_state(b"1234", &desc).unwrap().1, mode);
+
+            let expected = decrypt_encrypted_ds2(&stated, b"1234").unwrap();
+            let plain = decrypt_encrypted_ds2(&unstated, b"1234").unwrap();
+            assert_eq!(plain[DS2_HEADER_SIZE..], expected[DS2_HEADER_SIZE..]);
+            let mut decryptor = EncryptedDs2BlockDecryptor::new(b"1234");
+            assert_eq!(decryptor.push(&unstated).unwrap(), plain);
+
+            let decoded = crate::decode_to_buffer_with_password(&unstated, Some(b"1234")).unwrap();
+            let reference = crate::decode_to_buffer_with_password(&stated, Some(b"1234")).unwrap();
+            assert_eq!(decoded.samples, reference.samples);
+            assert!(matches!(
+                decrypt_encrypted_ds2(&unstated, b"4321"),
+                Err(DecodeError::EncryptedDs2(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn encrypted_stream_decryptor_finish_lenient_decrypts_whole_chunks() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        let full = decrypt_encrypted_ds2(&data, b"1234").unwrap();
+
+        for (cut, kept) in [
+            (1, 1),
+            (6, 6),
+            (21, 6),
+            (22, 22),
+            (100, 86),
+            (501, 486),
+            (502, 502),
+            (511, 511),
+        ] {
+            let mut decryptor = EncryptedDs2BlockDecryptor::new(b"1234");
+            let mut plain = decryptor.push(&data[..whole + cut]).unwrap();
+            assert_eq!(plain.len(), whole);
+            plain.extend(decryptor.finish_lenient().unwrap());
+            assert_eq!(plain, full[..whole + kept], "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn encrypted_stream_decryptor_strict_finish_rejects_every_partial_record() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        for cut in [1, 6, 22, 502, 511] {
+            let mut decryptor = EncryptedDs2BlockDecryptor::new(b"1234");
+            let _ = decryptor.push(&data[..whole + cut]).unwrap();
+            assert!(matches!(
+                decryptor.finish(),
+                Err(DecodeError::Truncated(what)) if what == "encrypted DS2 block"
+            ));
+        }
+    }
+
+    #[test]
+    fn decode_encrypted_file_with_partial_last_block() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        let expected =
+            crate::decode_to_buffer_with_password(&data[..whole], Some(b"1234")).unwrap();
+        assert_eq!(expected.samples.len(), 18 * 256);
+        let plain = decrypt_encrypted_ds2(&data, b"1234").unwrap();
+
+        for (cut, kept, frames) in [
+            (1, 1, 18),
+            (DS2_BLOCK_HEADER_SIZE, DS2_BLOCK_HEADER_SIZE, 18),
+            (62, 54, 19),
+            (100, 86, 20),
+            (DS2_BLOCK_SIZE - 1, DS2_BLOCK_SIZE - 1, 27),
+        ] {
+            let decoded =
+                crate::decode_to_buffer_with_password(&data[..whole + cut], Some(b"1234")).unwrap();
+            assert_eq!(decoded.samples.len(), frames * 256, "cut {cut}");
+            assert_eq!(decoded.samples[..18 * 256], expected.samples[..]);
+            let reference = crate::decode_to_buffer(&plain[..whole + kept]).unwrap();
+            assert_eq!(decoded.samples, reference.samples, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn encrypted_stream_decryptor_finish_lenient_rejects_truncated_header() {
+        let data = encrypted_qp_file(1);
+        for cut in [4, DECRYPT_DESCRIPTOR_OFFSET + 4, DS2_HEADER_SIZE - 1] {
+            let mut decryptor = EncryptedDs2BlockDecryptor::new(b"1234");
+            assert!(decryptor.push(&data[..cut]).unwrap().is_empty());
+            let err = decryptor.finish_lenient().unwrap_err();
+            assert!(matches!(err, DecodeError::Truncated(_)));
+        }
+    }
+
+    #[test]
+    fn decrypting_decoder_strict_finish_accepts_cut_without_frame_in_progress() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        for (cut, frames) in [(1, 18), (DS2_BLOCK_SIZE - 1, 27)] {
+            let mut decoder = crate::streaming::DecryptingDecoderStreamer::new(Some(b"1234"));
+            let mut samples = decoder.push(&data[..whole + cut]).unwrap();
+            samples.extend(decoder.finish().unwrap());
+            assert_eq!(samples.len(), frames * 256, "cut {cut}");
+            let lenient =
+                crate::decode_to_buffer_with_password(&data[..whole + cut], Some(b"1234")).unwrap();
+            assert_eq!(samples, lenient.samples, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn decrypting_decoder_strict_finish_rejects_frame_in_progress() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        for cut in [DS2_BLOCK_HEADER_SIZE, 62, 100] {
+            let mut decoder = crate::streaming::DecryptingDecoderStreamer::new(Some(b"1234"));
+            let _ = decoder.push(&data[..whole + cut]).unwrap();
+            assert!(
+                matches!(
+                    decoder.finish(),
+                    Err(DecodeError::Truncated(what)) if what == "DS2 QP frame"
+                ),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_encrypted_file_with_partial_block_rejects_wrong_password() {
+        let data = encrypted_qp_file(3);
+        let cut = &data[..2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE + 100];
+        let result = crate::decode_to_buffer_with_password(cut, Some(b"9999"));
+        assert!(matches!(result, Err(DecodeError::EncryptedDs2(_))));
     }
 }

@@ -27,6 +27,7 @@ const PULSE_BITS: u32 = 3;
 const PITCH_BITS: u32 = 8;
 const CB_BITS: u32 = 40;
 const QP7_SHORT_GAIN_BITS: u32 = 5;
+const QP7_LAST_REFL: [f64; 4] = [-0.1867048007, -0.04395632825, 0.05342162361, 0.172256036];
 const QP7_SHORT_GAIN_TABLE: [f64; 64] = [
     0.0, 0.000152587890625, 0.00030517578125, 0.000457763671875,
     0.000640869140625, 0.0008544921875, 0.001068115234375, 0.00128173828125,
@@ -141,8 +142,10 @@ impl Ds2QpDecoder {
                 refl_indices[i] = reader.read_bits(QP7_REFL_BIT_ALLOC[i]) as usize;
             }
 
+            let mut coeffs = self.dequantize_reflection_coeffs(&refl_indices);
+            coeffs[NUM_COEFFS - 1] = QP7_LAST_REFL[refl_indices[NUM_COEFFS - 1]];
+
             if is_short {
-                let coeffs = self.dequantize_reflection_coeffs(&refl_indices);
                 for _ in 0..NUM_SUBFRAMES {
                     let gain_idx = reader.read_bits(QP7_SHORT_GAIN_BITS) as usize;
                     let gain = QP7_SHORT_GAIN_TABLE[gain_idx.min(QP7_SHORT_GAIN_TABLE.len() - 1)];
@@ -152,13 +155,12 @@ impl Ds2QpDecoder {
                         *sample = (self.prng_state as i16) as f64 * gain;
                     }
                     let output = lattice_synthesis(&excitation, &coeffs, &mut self.lattice_state);
-                    self.update_pitch_memory(&excitation);
                     all_samples.extend_from_slice(&output);
                 }
                 continue;
             }
 
-            all_samples.extend_from_slice(&self.decode_qp7_long_record(&mut reader, &refl_indices));
+            all_samples.extend_from_slice(&self.decode_qp7_long_record(&mut reader, &coeffs));
         }
 
         all_samples
@@ -176,9 +178,9 @@ impl Ds2QpDecoder {
     fn decode_qp7_long_record(
         &mut self,
         reader: &mut BitstreamReader,
-        refl_indices: &[usize; NUM_COEFFS],
+        coeffs: &[f64; NUM_COEFFS],
     ) -> Vec<f64> {
-        self.decode_long_like_record_with_alloc(reader, refl_indices, PITCH_BITS)
+        self.decode_long_like_record_with_alloc(reader, coeffs, PITCH_BITS)
     }
 
     fn decode_long_like_record(
@@ -186,13 +188,14 @@ impl Ds2QpDecoder {
         reader: &mut BitstreamReader,
         refl_indices: &[usize; NUM_COEFFS],
     ) -> Vec<f64> {
-        self.decode_long_like_record_with_alloc(reader, refl_indices, PITCH_BITS)
+        let coeffs = self.dequantize_reflection_coeffs(refl_indices);
+        self.decode_long_like_record_with_alloc(reader, &coeffs, PITCH_BITS)
     }
 
     fn decode_long_like_record_with_alloc(
         &mut self,
         reader: &mut BitstreamReader,
-        refl_indices: &[usize; NUM_COEFFS],
+        coeffs: &[f64; NUM_COEFFS],
         pitch_bits: u32,
     ) -> Vec<f64> {
         let mut subframe_data = Vec::with_capacity(NUM_SUBFRAMES);
@@ -211,8 +214,7 @@ impl Ds2QpDecoder {
             subframe_data.push((pg_idx, cb_idx, gain_idx, pulses));
         }
 
-        let coeffs = self.dequantize_reflection_coeffs(refl_indices);
-        self.decode_subframes_with_coeffs(&coeffs, &subframe_data, &pitches)
+        self.decode_subframes_with_coeffs(coeffs, &subframe_data, &pitches)
     }
 
     fn dequantize_reflection_coeffs(&self, refl_indices: &[usize; NUM_COEFFS]) -> [f64; NUM_COEFFS] {
@@ -250,18 +252,13 @@ impl Ds2QpDecoder {
             }
 
             let gc = QP_EXCITATION_GAIN[*gain_idx];
-            // Misaligned frames in NCH selective-extraction cut files can carry
-            // a fixed-codebook index past C(64,11); the reference decoder then
-            // drops the first pulse and places the remaining ten at positions
-            // 9..0 (verified sample-exact against the NCH decodes).
-            let positions = if *cb_idx >= QP_COMB_MAX {
-                let mut p = Vec::with_capacity(EXCITATION_PULSES);
-                p.push(SUBFRAME_SIZE); // slot 0 dropped by the range guard below
-                p.extend((1..EXCITATION_PULSES).map(|i| EXCITATION_PULSES - 1 - i));
-                p
-            } else {
-                decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES)
-            };
+            // An index of C(64,11) or more is clamped to C(64,11) - 1, which
+            // puts the pulses at positions 63..53.
+            let positions = decode_combinatorial_index(
+                (*cb_idx).min(QP_COMB_MAX - 1),
+                SUBFRAME_SIZE,
+                EXCITATION_PULSES,
+            );
             let mut fixed_exc = [0.0f64; SUBFRAME_SIZE];
             for (pi, &pos) in positions.iter().enumerate() {
                 if pos < SUBFRAME_SIZE {
@@ -297,6 +294,197 @@ impl Ds2QpDecoder {
                 samples[i] += alpha * samples[i - 1];
             }
             self.deemph_state = *samples.last().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack(fields: &[(u32, u64)], len: usize) -> Vec<u8> {
+        let mut bits = Vec::new();
+        for &(width, value) in fields {
+            for b in (0..width).rev() {
+                bits.push((value >> b) & 1 == 1);
+            }
+        }
+        let mut words = vec![0u8; len];
+        for (i, &bit) in bits.iter().enumerate() {
+            if bit {
+                let byte = i / 8;
+                words[byte ^ 1] |= 0x80 >> (i % 8);
+            }
+        }
+        words
+    }
+
+    const REFL: [usize; NUM_COEFFS] = [5, 9, 3, 7, 2, 4, 6, 1, 3, 5, 2, 7, 1, 4, 2, 3];
+    const GAINS: [usize; NUM_SUBFRAMES] = [31, 7, 19, 0];
+
+    fn noise_record(refl: &[usize; NUM_COEFFS]) -> Vec<u8> {
+        let mut fields = vec![(1, 0)];
+        for i in 0..NUM_COEFFS {
+            fields.push((QP7_REFL_BIT_ALLOC[i], refl[i] as u64));
+        }
+        for gain in GAINS {
+            fields.push((QP7_SHORT_GAIN_BITS, gain as u64));
+        }
+        pack(&fields, 12)
+    }
+
+    fn long_record(refl: &[usize; NUM_COEFFS]) -> Vec<u8> {
+        let mut fields = vec![(1, 1)];
+        for i in 0..NUM_COEFFS {
+            fields.push((QP7_REFL_BIT_ALLOC[i], refl[i] as u64));
+        }
+        let cb = [123_456_789u64, 5_000_000_000, 1, 743_595_781_823];
+        for sf in 0..NUM_SUBFRAMES {
+            fields.push((PITCH_BITS, [20, 100, 37, 255][sf]));
+            fields.push((PITCH_GAIN_BITS, [10, 40, 63, 0][sf]));
+            fields.push((CB_BITS, cb[sf]));
+            fields.push((GAIN_BITS, [30, 5, 63, 17][sf]));
+            for p in 0..EXCITATION_PULSES {
+                fields.push((PULSE_BITS, ((p + sf) % 8) as u64));
+            }
+        }
+        pack(&fields, 56)
+    }
+
+    fn qp_frame(cb_idx: u64) -> Vec<u8> {
+        let mut fields = Vec::new();
+        for i in 0..NUM_COEFFS {
+            fields.push((REFL_BIT_ALLOC[i], REFL[i] as u64));
+        }
+        for _ in 0..NUM_SUBFRAMES {
+            fields.push((PITCH_BITS, 0));
+            fields.push((PITCH_GAIN_BITS, 0));
+            fields.push((CB_BITS, cb_idx));
+            fields.push((GAIN_BITS, 30));
+            fields.extend([(PULSE_BITS, 7); EXCITATION_PULSES]);
+        }
+        pack(&fields, 56)
+    }
+
+    fn decode_qp7(decoder: &mut Ds2QpDecoder, records: Vec<Vec<u8>>) -> Vec<f64> {
+        let total_frames = records.len();
+        decoder.decode_qp7_segments(&[Ds2Qp7Segment {
+            records,
+            total_frames,
+            reset_before: false,
+        }])
+    }
+
+    #[test]
+    fn test_qp7_noise_frame_uses_last_coefficient_codebook() {
+        let last = [-0.1867048007, -0.04395632825, 0.05342162361, 0.172256036];
+        for (index, &last_coeff) in last.iter().enumerate() {
+            let mut refl = REFL;
+            refl[NUM_COEFFS - 1] = index;
+            let mut coeffs = [0.0f64; NUM_COEFFS];
+            for i in 0..NUM_COEFFS - 1 {
+                coeffs[i] = qp_codebook_lookup(i, refl[i]);
+            }
+            coeffs[NUM_COEFFS - 1] = last_coeff;
+
+            let mut seed = 0u16;
+            let mut state = [0.0f64; NUM_COEFFS];
+            let mut expected = Vec::new();
+            for gain in GAINS {
+                let excitation: Vec<f64> = (0..SUBFRAME_SIZE)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(0x209).wrapping_add(0x103);
+                        seed as i16 as f64 * QP7_SHORT_GAIN_TABLE[gain]
+                    })
+                    .collect();
+                expected.extend(lattice_synthesis(&excitation, &coeffs, &mut state));
+            }
+            for i in 1..expected.len() {
+                expected[i] += 0.1 * expected[i - 1];
+            }
+
+            let actual = decode_qp7(&mut Ds2QpDecoder::new(), vec![noise_record(&refl)]);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_qp7_noise_frame_leaves_pitch_memory() {
+        let mut decoder = Ds2QpDecoder::new();
+        let samples = decode_qp7(&mut decoder, vec![noise_record(&REFL)]);
+        assert!(samples.iter().any(|&s| s != 0.0));
+        assert!(decoder.lattice_state.iter().any(|&s| s != 0.0));
+        assert!(decoder.pitch_memory.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn test_qp7_zero_filled_record_decodes_silence() {
+        let mut decoder = Ds2QpDecoder::new();
+        let samples = decode_qp7(&mut decoder, vec![vec![0u8; 56]]);
+        assert_eq!(samples, vec![0.0; SAMPLES_PER_FRAME]);
+        assert!(decoder.pitch_memory.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn test_qp7_long_frame_uses_last_coefficient_codebook() {
+        let record = long_record(&REFL);
+        let mut coeffs = [0.0f64; NUM_COEFFS];
+        for i in 0..NUM_COEFFS - 1 {
+            coeffs[i] = qp_codebook_lookup(i, REFL[i]);
+        }
+        coeffs[NUM_COEFFS - 1] = 0.172256036;
+
+        let mut reference = Ds2QpDecoder::new();
+        let mut reader = BitstreamReader::new(&record);
+        reader.read_bits(1);
+        for bits in QP7_REFL_BIT_ALLOC {
+            reader.read_bits(bits);
+        }
+        let mut expected =
+            reference.decode_long_like_record_with_alloc(&mut reader, &coeffs, PITCH_BITS);
+        reference.apply_deemphasis(&mut expected);
+
+        let mut decoder = Ds2QpDecoder::new();
+        assert_eq!(decode_qp7(&mut decoder, vec![record]), expected);
+        assert_eq!(decoder.pitch_memory, reference.pitch_memory);
+    }
+
+    #[test]
+    fn test_qp7_cut_record_decodes_like_zero_filled_record() {
+        let cut = long_record(&REFL)[..20].to_vec();
+        let mut filled = cut.clone();
+        filled.resize(56, 0);
+        let samples = decode_qp7(&mut Ds2QpDecoder::new(), vec![cut]);
+        assert_eq!(samples.len(), SAMPLES_PER_FRAME);
+        assert_eq!(samples, decode_qp7(&mut Ds2QpDecoder::new(), vec![filled]));
+    }
+
+    #[test]
+    fn test_qp7_empty_record_decodes_as_zero_gain_noise_frame() {
+        let first = noise_record(&REFL);
+        let samples = decode_qp7(&mut Ds2QpDecoder::new(), vec![first.clone(), Vec::new()]);
+        assert_eq!(samples.len(), 2 * SAMPLES_PER_FRAME);
+        assert_eq!(
+            samples,
+            decode_qp7(&mut Ds2QpDecoder::new(), vec![first, vec![0u8; 12]])
+        );
+    }
+
+    #[test]
+    fn test_qp_index_from_comb_max_puts_pulses_at_63_to_53() {
+        let top: Vec<usize> = (53..64).rev().collect();
+        let expected = Ds2QpDecoder::new().decode_frame(&qp_frame(QP_COMB_MAX - 1));
+        for cb_idx in [QP_COMB_MAX, QP_COMB_MAX + 1, (1u64 << CB_BITS) - 1] {
+            let mut decoder = Ds2QpDecoder::new();
+            let samples = decoder.decode_frame(&qp_frame(cb_idx));
+            let start = decoder.pitch_memory.len() - SAMPLES_PER_FRAME;
+            let first = &decoder.pitch_memory[start..start + SUBFRAME_SIZE];
+            let positions: Vec<usize> = (0..SUBFRAME_SIZE)
+                .rev()
+                .filter(|&i| first[i] != 0.0)
+                .collect();
+            assert_eq!(positions, top);
+            assert_eq!(samples, expected);
         }
     }
 }
