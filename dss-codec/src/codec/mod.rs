@@ -2,4 +2,5 @@ pub mod common;
 pub mod dss_sp;
 pub mod ds2_sp;
 pub mod ds2_qp;
+pub mod g723_1;
 pub mod grundig_sp;

@@ -32,9 +32,43 @@ DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
 
 | File Type | Codec | Native Rate | Detection |
 |-----------|-------|-------------|-----------|
-| `.dss` (v2/v3) | DSS SP | 11025 Hz | Header `{02\|03}dss` |
-| `.ds2` mode 0-1 | DS2 SP | 12000 Hz | Header `\x03ds2`, byte4 < 6 |
-| `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `\x03ds2`, byte4 >= 6 |
+| `.dss` (v2/v3) | DSS SP | 12000 Hz | Header `{00..ff}dss`, byte4 is 0 or 1 |
+| `.ds2` mode 0-1 | DSS SP | 12000 Hz | Header `{01..ff}ds2`, byte4 is 0 or 1 |
+| `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `{01..ff}ds2`, byte4 is 6 or 7 |
+| `.dss`, `.ds2` mode 2 or 4 | LP (G.723.1) | 8000 Hz | Header `{00..ff}dss` or `{01..ff}ds2`, byte4 is 2 or 4 |
+
+The first byte of a DS2 file, 0x01 to 0xff, is its header length in
+512-byte blocks. 0x01 means one block when byte 3 of the block at 0x200
+is 0xff, as in an audio block header. Otherwise 0x01 means three blocks.
+The first byte of a DSS file is its header length in blocks too, and
+there 0x00 and 0x01 both mean one block. A DSS file with first byte 0x06
+and codec byte 0 is read as a Grundig file.
+
+DS2 SP files hold the same blocks and frames as DSS SP files and decode
+the same way. Byte 4 of each audio block header is the block's format
+when byte 3 is 0xff: 0 SP, 1 variable rate SP, 2 or 4 LP, 6 QP and 7
+QP7. A block with another value there, or whose byte 3 is not 0xff,
+takes the format of the last block before it that has frames, and a
+block before any such block takes the format of the first block with
+frames in a known format. A run of blocks in one format is a part, and
+each part decodes with its own codec at its own rate. The first part
+starts at the first frame the decoder reads, and its format and rate are
+the file's. A file in which no block with frames has byte 3 set to 0xff
+and a format byte in this list fails with `UnsupportedCodec`.
+
+LP blocks hold ITU-T G.723.1 frames, decoded at 8000 Hz. A frame is 24,
+20, 4 or 1 bytes long, as the two low bits of its first byte say: 6.3
+kbit/s, 5.3 kbit/s, comfort noise (SID) or no data. As with QP, frames
+run on from block to block and are not byte-swapped. Byte 2 of a block
+header counts the frames that start in the block, or byte 5 does in a
+pause block, and the anchor in bytes 0 and 1 is where the first of them
+starts. A frame that does not end at the next block's anchor is dropped,
+and reading resumes at the anchor.
+
+Some files hold a stale copy of their header blocks right after the
+header. A block there that starts with a "dss" or "ds2" header is such a
+copy. The decoder skips it and the blocks that its first byte counts,
+and reads the audio after them.
 
 Encrypted DS2 files with header `\x03enc` are also supported when a password is provided, and can be either decoded directly or normalized back to a plain `.ds2` container with `--decrypt`.
 

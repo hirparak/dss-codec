@@ -8,11 +8,16 @@ Replaces the Wine + Olympus DirectShow + NCH Switch pipeline with a standalone b
 
 | Format | Extension | Sample Rate | Quality | Bit Rate |
 |--------|-----------|-------------|---------|----------|
-| DSS SP | `.dss` | 11025 Hz | Standard | ~13.7 kbps |
-| DS2 SP | `.ds2` (mode 0) | 12000 Hz | Standard | ~13.7 kbps |
+| DSS SP | `.dss` | 12000 Hz | Standard | ~13.7 kbps |
+| DS2 SP | `.ds2` (mode 0-1) | 12000 Hz | Standard | ~13.7 kbps |
 | DS2 QP | `.ds2` (mode 6) | 16000 Hz | Quality | ~28 kbps |
+| DSS/DS2 LP | `.dss`, `.ds2` (mode 2 or 4) | 8000 Hz | Long play | 6.3 or 5.3 kbps (G.723.1) |
 
-Format is auto-detected from the file header.
+Format is auto-detected from the file header. DS2 SP files hold DSS SP
+frames and decode the same way. LP blocks hold ITU-T G.723.1 frames,
+which decode with the decoder in `src/codec/g723_1.rs`, postfilter on.
+It reproduces the ITU test vectors sample for sample; see
+`tests/g723_1_vectors.rs` for how to run them.
 
 ## Installation
 
@@ -113,7 +118,7 @@ decode_and_write(
 pub struct AudioBuffer {
     pub samples: Vec<f64>,     // Mono samples (f64 internally)
     pub native_rate: u32,      // Native sample rate before resampling
-    pub format: AudioFormat,   // Detected format (DssSp, Ds2Sp, Ds2Qp)
+    pub format: AudioFormat,   // Detected format (DssSp, Ds2Sp, Ds2Qp, DssLp, Ds2Lp, ...)
 }
 ```
 
@@ -127,14 +132,16 @@ Input File
     |
     ├── DSS: block-aware byte-swap demuxer → 42-byte packets
     ├── DS2 SP: byte-swap demuxer → 42-byte packets
-    └── DS2 QP: continuous bitstream concatenation
+    ├── DS2 QP: continuous bitstream concatenation
+    └── LP: G.723.1 frames read across blocks from each block's anchor
     |
     v
 [Decoder] ─── per-format CELP decoder
     |
     ├── DSS SP: Q15 integer, Levinson, noise modulation, sinc resample
     ├── DS2 SP: f64, lattice synthesis, C(72,7) codebook
-    └── DS2 QP: f64, lattice synthesis, C(64,11) codebook, de-emphasis
+    ├── DS2 QP: f64, lattice synthesis, C(64,11) codebook, de-emphasis
+    └── LP: ITU-T G.723.1 fixed point, 6.3/5.3 kbit/s, comfort noise, postfilter
     |
     v
 AudioBuffer (f64 samples at native rate)
@@ -143,7 +150,7 @@ AudioBuffer (f64 samples at native rate)
 [Output] ─── optional resample (rubato) → WAV (hound)
 ```
 
-All three decoders implement CELP (Code-Excited Linear Prediction) with:
+The three SP and QP decoders implement CELP (Code-Excited Linear Prediction) with:
 - Reflection coefficient codebooks for spectral envelope
 - Pitch-adaptive excitation (long-term prediction)
 - Combinatorial fixed codebook excitation (short-term)
